@@ -78,11 +78,12 @@ async def metadata(filename: str, channel: int, msg_id) -> dict | None:
         if not episode:
             season = 1
             episode = title.split()[-1]
+            title = title.rsplit(' ', 1)[0]
             LOGGER.info(f"Assuming S01E{episode} for {filename}")
         else:
             season = 1
             LOGGER.info(f"Assuming Season 1 for {filename}")
-        return None
+        return await fetch_tv_metadata(title, season, episode, encoded_string, year, quality, default_id)
     
     if not quality:
         LOGGER.warning(f"Skipping {filename}: No resolution (parsed={parsed})")
