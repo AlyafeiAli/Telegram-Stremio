@@ -73,6 +73,16 @@ async def metadata(filename: str, channel: int, msg_id) -> dict | None:
     episode = parsed.get("episode")
     year = parsed.get("year")
     quality = parsed.get("resolution")
+
+    if not season and not year:
+        if not episode:
+            season = 1
+            episode = title.split()[-1]
+            LOGGER.info(f"Assuming S01E{episode} for {filename}")
+        else:
+            season = 1
+            LOGGER.info(f"Assuming Season 1 for {filename}")
+        return None
     
     if not quality:
         LOGGER.warning(f"Skipping {filename}: No resolution (parsed={parsed})")
