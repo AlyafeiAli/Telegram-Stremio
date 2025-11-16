@@ -5,7 +5,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from Backend import db
 from Backend.helper.custom_filter import CustomFilters
-from Backend.helper.metadata import fetch_tv_metadata, fetch_movie_metadata, API_SEMAPHORE
+from Backend.helper.metadata import fetch_tv_metadata, fetch_movie_metadata
 from Backend.logger import LOGGER
 
 CANCEL_REQUESTED = False
@@ -82,7 +82,7 @@ async def fix_metadata_handler(_, message):
 
         async with semaphore:
             try:
-                if movie_doc.get("cast") and movie_doc.get("description") and movie_doc.get("genres"):
+                if movie_doc.get("cast") and movie_doc.get("description") and movie_doc.get("genres") and movie_doc.get("logo") not in [None, ""]:
                     DONE += 1
                     return
 
@@ -102,6 +102,7 @@ async def fix_metadata_handler(_, message):
                     await collection.update_one(
                         {"tmdb_id": tmdb_id},
                         {"$set": {
+                            "tmdb_id": meta.get("tmdb_id"),
                             "imdb_id": meta.get("imdb_id"),
                             "cast": meta.get("cast"),
                             "description": meta.get("description"),
@@ -134,7 +135,7 @@ async def fix_metadata_handler(_, message):
                 year = tv_doc.get("release_year")
 
                 # SHOW-LEVEL UPDATE
-                has_meta = tv_doc.get("cast") and tv_doc.get("description") and tv_doc.get("genres")
+                has_meta = tv_doc.get("cast") and tv_doc.get("description") and tv_doc.get("genres") and tv_doc.get("logo") not in [None, ""]
                 if not has_meta:
                     meta = await fetch_tv_metadata(
                         title=title,
@@ -150,6 +151,7 @@ async def fix_metadata_handler(_, message):
                         await collection.update_one(
                             {"tmdb_id": tmdb_id},
                             {"$set": {
+                                "tmdb_id": meta.get("tmdb_id"),
                                 "imdb_id": meta.get("imdb_id"),
                                 "cast": meta.get("cast"),
                                 "description": meta.get("description"),

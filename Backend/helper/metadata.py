@@ -29,6 +29,17 @@ def format_tmdb_image(path: str, size="w500") -> str:
         return ""
     return f"https://image.tmdb.org/t/p/{size}{path}"
 
+def get_tmdb_logo(images) -> str:
+    if not images or not getattr(images, "logos", None):
+        return ""
+
+    logos = images.logos
+
+    for logo in logos:
+        if getattr(logo, "iso_639_1", None) == "en":
+            return format_tmdb_image(logo.file_path, "original")
+    return format_tmdb_image(logos[0].file_path, "original") if logos else ""
+
 def format_imdb_images(imdb_id: str) -> dict:
     if not imdb_id:
         return {"poster": "", "backdrop": "", "logo": ""}
@@ -80,7 +91,7 @@ async def _tmdb_tv_details(tv_id):
         return TMDB_DETAILS_CACHE[tv_id]
     try:
         async with API_SEMAPHORE:
-            details = await tmdb.tv(tv_id).details(append_to_response="external_ids,credits")
+            details = await tmdb.tv(tv_id).details(append_to_response="external_ids,credits,images")
         TMDB_DETAILS_CACHE[tv_id] = details
         return details
     except Exception as e:
@@ -93,7 +104,7 @@ async def _tmdb_movie_details(movie_id):
         return TMDB_DETAILS_CACHE[movie_id]
     try:
         async with API_SEMAPHORE:
-            details = await tmdb.movie(movie_id).details(append_to_response="external_ids,credits")
+            details = await tmdb.movie(movie_id).details(append_to_response="external_ids,credits,images")
         TMDB_DETAILS_CACHE[movie_id] = details
         return details
     except Exception as e:
@@ -245,7 +256,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
             "description": tv_details.overview or "",
             "poster": format_tmdb_image(tv_details.poster_path),
             "backdrop": format_tmdb_image(tv_details.backdrop_path, "original"),
-            "logo": "",
+            "logo": get_tmdb_logo(getattr(tv_details, "images", None)),
             "genres": [g.name for g in (tv_details.genres or [])],
             "media_type": "tv",
             "cast": cast_names,
@@ -267,7 +278,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
     images = format_imdb_images(imdb_id)
 
     return {
-        "tmdb_id": imdb_id.replace("tt", "") if imdb_id else "",
+        "tmdb_id": (tv_details.get("moviedb_id") or (imdb_id.replace("tt", "") if imdb_id else "")),
         "imdb_id": imdb_id,
         "title": tv_details.get("title", title),
         "year": tv_details.get("releaseDetailed", {}).get("year", 0),
@@ -339,7 +350,7 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
             "description": movie_details.overview or "",
             "poster": format_tmdb_image(movie_details.poster_path),
             "backdrop": format_tmdb_image(movie_details.backdrop_path, "original"),
-            "logo": "",
+            "logo": get_tmdb_logo(getattr(movie_details, "images", None)),
             "cast": cast_names,
             "media_type": "movie",
             "genres": [g.name for g in (movie_details.genres or [])],
@@ -352,7 +363,7 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
     images = format_imdb_images(imdb_id)
 
     return {
-        "tmdb_id": imdb_id.replace("tt", "") if imdb_id else "",
+        "tmdb_id": (movie_details.get("moviedb_id") or (imdb_id.replace("tt", "") if imdb_id else "")),
         "imdb_id": imdb_id,
         "title": movie_details.get("title", title),
         "year": movie_details.get("releaseDetailed", {}).get("year", 0),
