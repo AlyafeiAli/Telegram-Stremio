@@ -78,6 +78,7 @@ async def get_detail(imdb_id: str) -> Optional[Dict[str, Any]]:
                         break
             return {
                 'id': meta.get('imdb_id', meta.get('id', '')),
+                'moviedb_id': meta.get('moviedb_id', ''),
                 'type': meta.get('type', media_type),
                 'title': meta.get('name', ''),
                 'plot': meta.get('description', ''),
