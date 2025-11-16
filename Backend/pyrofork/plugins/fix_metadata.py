@@ -68,7 +68,6 @@ async def fix_metadata_handler(_, message):
         ])
     )
 
-    # concurrency controls
     CONCURRENCY = 20
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
@@ -82,14 +81,11 @@ async def fix_metadata_handler(_, message):
 
         async with semaphore:
             try:
-                if movie_doc.get("cast") and movie_doc.get("description") and movie_doc.get("genres") and movie_doc.get("logo") not in [None, ""]:
-                    DONE += 1
-                    return
-
-                tmdb_id = movie_doc["tmdb_id"]
+                imdb_id = movie_doc.get("imdb_id")
                 title = movie_doc["title"]
                 year = movie_doc.get("release_year")
 
+                # Always fetch metadata to update tmdb_id + imdb_id
                 meta = await fetch_movie_metadata(
                     title=title,
                     encoded_string=None,
@@ -99,19 +95,20 @@ async def fix_metadata_handler(_, message):
                 )
 
                 if meta:
+                    update_data = {
+                        "tmdb_id": meta.get("tmdb_id"),
+                        "imdb_id": meta.get("imdb_id"),
+                        "rating": meta.get("rate"),
+                    }
+
+                    # only overwrite empty fields (not IDs)
+                    for key in ["cast", "description", "genres", "poster", "backdrop", "logo"]:
+                        if not movie_doc.get(key):
+                            update_data[key] = meta.get(key)
+
                     await collection.update_one(
-                        {"tmdb_id": tmdb_id},
-                        {"$set": {
-                            "tmdb_id": meta.get("tmdb_id"),
-                            "imdb_id": meta.get("imdb_id"),
-                            "cast": meta.get("cast"),
-                            "description": meta.get("description"),
-                            "genres": meta.get("genres"),
-                            "poster": meta.get("poster"),
-                            "backdrop": meta.get("backdrop"),
-                            "logo": meta.get("logo"),
-                            "rating": meta.get("rate"),
-                        }}
+                        {"imdb_id": imdb_id},
+                        {"$set": update_data}
                     )
 
                 DONE += 1
@@ -130,59 +127,51 @@ async def fix_metadata_handler(_, message):
 
         async with semaphore:
             try:
-                tmdb_id = tv_doc["tmdb_id"]
+                imdb_id = tv_doc.get("imdb_id")
                 title = tv_doc["title"]
                 year = tv_doc.get("release_year")
 
-                # SHOW-LEVEL UPDATE
-                has_meta = tv_doc.get("cast") and tv_doc.get("description") and tv_doc.get("genres") and tv_doc.get("logo") not in [None, ""]
-                if not has_meta:
-                    meta = await fetch_tv_metadata(
-                        title=title,
-                        season=1,
-                        episode=1,
-                        encoded_string=None,
-                        year=year,
-                        quality=None,
-                        default_id=None
+                # Always fetch metadata for refreshed imdb_id + tmdb_id
+                meta = await fetch_tv_metadata(
+                    title=title,
+                    season=1,
+                    episode=1,
+                    encoded_string=None,
+                    year=year,
+                    quality=None,
+                    default_id=None
+                )
+
+                if meta:
+                    update_data = {
+                        "tmdb_id": meta.get("tmdb_id"),
+                        "imdb_id": meta.get("imdb_id"),
+                        "rating": meta.get("rate"),
+                    }
+
+                    # Only overwrite fields that are empty
+                    for key in ["cast", "description", "genres", "poster", "backdrop", "logo"]:
+                        if not tv_doc.get(key):
+                            update_data[key] = meta.get(key)
+
+                    await collection.update_one(
+                        {"imdb_id": imdb_id},
+                        {"$set": update_data}
                     )
 
-                    if meta:
-                        await collection.update_one(
-                            {"tmdb_id": tmdb_id},
-                            {"$set": {
-                                "tmdb_id": meta.get("tmdb_id"),
-                                "imdb_id": meta.get("imdb_id"),
-                                "cast": meta.get("cast"),
-                                "description": meta.get("description"),
-                                "genres": meta.get("genres"),
-                                "poster": meta.get("poster"),
-                                "backdrop": meta.get("backdrop"),
-                                "logo": meta.get("logo"),
-                                "rating": meta.get("rate"),
-                            }}
-                        )
-
-                # EPISODE UPDATES (NO DONE += 1 HERE — AS YOU REQUESTED)
+                # EPISODES UPDATE
                 tasks = []
-
                 for season in tv_doc.get("seasons", []):
-                    if CANCEL_REQUESTED:
-                        break
-
-                    s = season.get("season_number")
+                    s_num = season.get("season_number")
 
                     for ep in season.get("episodes", []):
-                        if CANCEL_REQUESTED:
-                            break
+                        e_num = ep.get("episode_number")
 
-                        e = ep.get("episode_number")
-
-                        # Skip if episode complete
+                        # Skip if already complete
                         if ep.get("overview") and ep.get("released") and ep.get("episode_backdrop"):
-                            continue  
+                            continue
 
-                        async def ep_task(s_local=s, e_local=e, tv_tmdb=tmdb_id):
+                        async def ep_task(s_local=s_num, e_local=e_num):
                             try:
                                 ep_meta = await fetch_tv_metadata(
                                     title=title,
@@ -196,7 +185,7 @@ async def fix_metadata_handler(_, message):
 
                                 if ep_meta:
                                     await collection.update_one(
-                                        {"tmdb_id": tv_tmdb},
+                                        {"imdb_id": imdb_id},
                                         {"$set": {
                                             "seasons.$[s].episodes.$[e].overview": ep_meta.get("episode_overview"),
                                             "seasons.$[s].episodes.$[e].released": ep_meta.get("episode_released"),
@@ -207,21 +196,16 @@ async def fix_metadata_handler(_, message):
                                             {"e.episode_number": e_local}
                                         ]
                                     )
-
                             except Exception as e:
                                 LOGGER.exception(f"Error updating episode {title} S{s_local}E{e_local}: {e}")
 
                         tasks.append(asyncio.create_task(ep_task()))
 
-                # RUN EPISODE TASKS
                 if tasks:
                     for i in range(0, len(tasks), CONCURRENCY):
-                        if CANCEL_REQUESTED:
-                            break
-                        batch = tasks[i:i+CONCURRENCY]
-                        await asyncio.gather(*batch, return_exceptions=True)
+                        await asyncio.gather(*tasks[i:i+CONCURRENCY], return_exceptions=True)
 
-                DONE += 1 
+                DONE += 1
 
             except Exception as e:
                 LOGGER.exception(f"Error updating TV show {tv_doc.get('title')}: {e}")
@@ -242,6 +226,7 @@ async def fix_metadata_handler(_, message):
             async for movie in cursor:
                 if CANCEL_REQUESTED:
                     break
+
                 tasks.append(_safe_update_movie(collection, movie))
 
                 if len(tasks) >= CONCURRENCY * 2:
@@ -252,13 +237,11 @@ async def fix_metadata_handler(_, message):
             await asyncio.gather(*tasks, return_exceptions=True)
 
     # -------------------------
-    # UPDATE TV SHOWS
+    # UPDATE TV
     # -------------------------
     async def update_tv():
         tasks = []
         for i in range(1, db.current_db_index + 1):
-            if CANCEL_REQUESTED:
-                break
 
             collection = db.dbs[f"storage_{i}"]["tv"]
             cursor = collection.find({})
@@ -266,6 +249,7 @@ async def fix_metadata_handler(_, message):
             async for tv in cursor:
                 if CANCEL_REQUESTED:
                     break
+
                 tasks.append(_safe_update_tv(collection, tv))
 
                 if len(tasks) >= CONCURRENCY * 2:
@@ -289,7 +273,6 @@ async def fix_metadata_handler(_, message):
         return
 
     elapsed = time.time() - start_time
-
     await status.edit_text(
         f"🎉 **Metadata Fix Completed!**\n"
         f"{progress_bar(DONE, TOTAL)}\n"
