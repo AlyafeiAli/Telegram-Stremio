@@ -1,11 +1,12 @@
 import time
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from Backend import db
 from Backend.helper.custom_filter import CustomFilters
-from Backend.helper.metadata import fetch_tv_metadata, fetch_movie_metadata
-
+from Backend.helper.metadata import fetch_tv_metadata, fetch_movie_metadata, API_SEMAPHORE
+from Backend.logger import LOGGER
 
 CANCEL_REQUESTED = False
 
@@ -13,9 +14,8 @@ CANCEL_REQUESTED = False
 # Progress Bar Helper
 # -------------------------------
 def progress_bar(done, total, length=20):
-    filled = int(length * (done / total))
+    filled = int(length * (done / total)) if total else length
     return f"[{'█' * filled}{'░' * (length - filled)}] {done}/{total}"
-
 
 # -------------------------------
 # ETA Helper
@@ -30,7 +30,6 @@ def format_eta(seconds):
         return f"{minutes}m {sec}s"
     return f"{sec}s"
 
-
 # -------------------------------
 # CANCEL BUTTON HANDLER
 # -------------------------------
@@ -40,7 +39,6 @@ async def cancel_fix(_, query):
     CANCEL_REQUESTED = True
     await query.message.edit_text("❌ Metadata fixing has been cancelled by the user.")
     await query.answer("Cancelled")
-
 
 # -------------------------------
 # MAIN COMMAND
@@ -70,26 +68,27 @@ async def fix_metadata_handler(_, message):
         ])
     )
 
+    # concurrency controls
+    CONCURRENCY = 20
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+
     # -------------------------
-    # UPDATE MOVIES
+    # MOVIE UPDATE
     # -------------------------
-    async def update_movies():
+    async def _safe_update_movie(collection, movie_doc):
         nonlocal DONE
-        for i in range(1, db.current_db_index + 1):
-            if CANCEL_REQUESTED:
-                return
+        if CANCEL_REQUESTED:
+            return
 
-            key = f"storage_{i}"
-            collection = db.dbs[key]["movie"]
-
-            cursor = collection.find({})
-            async for movie in cursor:
-                if CANCEL_REQUESTED:
+        async with semaphore:
+            try:
+                if movie_doc.get("cast") and movie_doc.get("description") and movie_doc.get("genres"):
+                    DONE += 1
                     return
 
-                tmdb_id = movie["tmdb_id"]
-                title = movie["title"]
-                year = movie.get("release_year")
+                tmdb_id = movie_doc["tmdb_id"]
+                title = movie_doc["title"]
+                year = movie_doc.get("release_year")
 
                 meta = await fetch_movie_metadata(
                     title=title,
@@ -116,128 +115,181 @@ async def fix_metadata_handler(_, message):
 
                 DONE += 1
 
-                # Update progress every 5 items
-                if DONE % 5 == 0:
-                    elapsed = time.time() - start_time
-                    avg_time = elapsed / DONE
-                    eta = avg_time * (TOTAL - DONE)
-
-                    await status.edit_text(
-                        f"🎬 Updating Movies…\n"
-                        f"{progress_bar(DONE, TOTAL)}\n"
-                        f"⏱ ETA: {format_eta(eta)}",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_fix")]
-                        ])
-                    )
-
-    # -------------------------
-    # UPDATE TV SHOWS + EPISODES
-    # -------------------------
-    async def update_tv():
-        nonlocal DONE
-        for i in range(1, db.current_db_index + 1):
-            if CANCEL_REQUESTED:
-                return
-
-            key = f"storage_{i}"
-            collection = db.dbs[key]["tv"]
-
-            cursor = collection.find({})
-            async for tv in cursor:
-                if CANCEL_REQUESTED:
-                    return
-
-                tmdb_id = tv["tmdb_id"]
-                title = tv["title"]
-                year = tv.get("release_year")
-
-                # Show-level update
-                meta = await fetch_tv_metadata(
-                    title=title,
-                    season=1,
-                    episode=1,
-                    encoded_string=None,
-                    year=year,
-                    quality=None,
-                    default_id=None
-                )
-
-                if meta:
-                    await collection.update_one(
-                        {"tmdb_id": tmdb_id},
-                        {"$set": {
-                            "imdb_id": meta.get("imdb_id"),
-                            "cast": meta.get("cast"),
-                            "description": meta.get("description"),
-                            "genres": meta.get("genres"),
-                            "poster": meta.get("poster"),
-                            "backdrop": meta.get("backdrop"),
-                            "logo": meta.get("logo"),
-                            "rating": meta.get("rate"),
-                        }}
-                    )
-
-                # Episode-level update
-                for season in tv["seasons"]:
-                    if CANCEL_REQUESTED:
-                        return
-
-                    s = season["season_number"]
-
-                    for ep in season["episodes"]:
-                        e = ep["episode_number"]
-
-                        ep_meta = await fetch_tv_metadata(
-                            title=title,
-                            season=s,
-                            episode=e,
-                            encoded_string=None,
-                            year=year,
-                            quality=None,
-                            default_id=None
-                        )
-
-                        if ep_meta:
-                            await collection.update_one(
-                                {"tmdb_id": tmdb_id},
-                                {"$set": {
-                                    "seasons.$[s].episodes.$[e].overview": ep_meta.get("episode_overview"),
-                                    "seasons.$[s].episodes.$[e].released": ep_meta.get("episode_released"),
-                                    "seasons.$[s].episodes.$[e].episode_backdrop": ep_meta.get("episode_backdrop"),
-                                }},
-                                array_filters=[
-                                    {"s.season_number": s},
-                                    {"e.episode_number": e}
-                                ]
-                            )
-
+            except Exception as e:
+                LOGGER.exception(f"Error updating movie {movie_doc.get('title')}: {e}")
                 DONE += 1
 
-                if DONE % 5 == 0:
-                    elapsed = time.time() - start_time
-                    avg_time = elapsed / DONE
-                    eta = avg_time * (TOTAL - DONE)
+    # -------------------------
+    # TV UPDATE
+    # -------------------------
+    async def _safe_update_tv(collection, tv_doc):
+        nonlocal DONE
+        if CANCEL_REQUESTED:
+            return
 
-                    await status.edit_text(
-                        f"📺 Updating TV Shows…\n"
-                        f"{progress_bar(DONE, TOTAL)}\n"
-                        f"⏱ ETA: {format_eta(eta)}",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_fix")]
-                        ])
+        async with semaphore:
+            try:
+                tmdb_id = tv_doc["tmdb_id"]
+                title = tv_doc["title"]
+                year = tv_doc.get("release_year")
+
+                # SHOW-LEVEL UPDATE
+                has_meta = tv_doc.get("cast") and tv_doc.get("description") and tv_doc.get("genres")
+                if not has_meta:
+                    meta = await fetch_tv_metadata(
+                        title=title,
+                        season=1,
+                        episode=1,
+                        encoded_string=None,
+                        year=year,
+                        quality=None,
+                        default_id=None
                     )
 
-    # Run the process
-    await update_movies()
-    if not CANCEL_REQUESTED:
-        await update_tv()
+                    if meta:
+                        await collection.update_one(
+                            {"tmdb_id": tmdb_id},
+                            {"$set": {
+                                "imdb_id": meta.get("imdb_id"),
+                                "cast": meta.get("cast"),
+                                "description": meta.get("description"),
+                                "genres": meta.get("genres"),
+                                "poster": meta.get("poster"),
+                                "backdrop": meta.get("backdrop"),
+                                "logo": meta.get("logo"),
+                                "rating": meta.get("rate"),
+                            }}
+                        )
+
+                # EPISODE UPDATES (NO DONE += 1 HERE — AS YOU REQUESTED)
+                tasks = []
+
+                for season in tv_doc.get("seasons", []):
+                    if CANCEL_REQUESTED:
+                        break
+
+                    s = season.get("season_number")
+
+                    for ep in season.get("episodes", []):
+                        if CANCEL_REQUESTED:
+                            break
+
+                        e = ep.get("episode_number")
+
+                        # Skip if episode complete
+                        if ep.get("overview") and ep.get("released") and ep.get("episode_backdrop"):
+                            continue  
+
+                        async def ep_task(s_local=s, e_local=e, tv_tmdb=tmdb_id):
+                            try:
+                                ep_meta = await fetch_tv_metadata(
+                                    title=title,
+                                    season=s_local,
+                                    episode=e_local,
+                                    encoded_string=None,
+                                    year=year,
+                                    quality=None,
+                                    default_id=None
+                                )
+
+                                if ep_meta:
+                                    await collection.update_one(
+                                        {"tmdb_id": tv_tmdb},
+                                        {"$set": {
+                                            "seasons.$[s].episodes.$[e].overview": ep_meta.get("episode_overview"),
+                                            "seasons.$[s].episodes.$[e].released": ep_meta.get("episode_released"),
+                                            "seasons.$[s].episodes.$[e].episode_backdrop": ep_meta.get("episode_backdrop"),
+                                        }},
+                                        array_filters=[
+                                            {"s.season_number": s_local},
+                                            {"e.episode_number": e_local}
+                                        ]
+                                    )
+
+                            except Exception as e:
+                                LOGGER.exception(f"Error updating episode {title} S{s_local}E{e_local}: {e}")
+
+                        tasks.append(asyncio.create_task(ep_task()))
+
+                # RUN EPISODE TASKS
+                if tasks:
+                    for i in range(0, len(tasks), CONCURRENCY):
+                        if CANCEL_REQUESTED:
+                            break
+                        batch = tasks[i:i+CONCURRENCY]
+                        await asyncio.gather(*batch, return_exceptions=True)
+
+                DONE += 1 
+
+            except Exception as e:
+                LOGGER.exception(f"Error updating TV show {tv_doc.get('title')}: {e}")
+                DONE += 1
+
+    # -------------------------
+    # UPDATE MOVIES
+    # -------------------------
+    async def update_movies():
+        tasks = []
+        for i in range(1, db.current_db_index + 1):
+            if CANCEL_REQUESTED:
+                break
+
+            collection = db.dbs[f"storage_{i}"]["movie"]
+            cursor = collection.find({})
+
+            async for movie in cursor:
+                if CANCEL_REQUESTED:
+                    break
+                tasks.append(_safe_update_movie(collection, movie))
+
+                if len(tasks) >= CONCURRENCY * 2:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    tasks = []
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    # -------------------------
+    # UPDATE TV SHOWS
+    # -------------------------
+    async def update_tv():
+        tasks = []
+        for i in range(1, db.current_db_index + 1):
+            if CANCEL_REQUESTED:
+                break
+
+            collection = db.dbs[f"storage_{i}"]["tv"]
+            cursor = collection.find({})
+
+            async for tv in cursor:
+                if CANCEL_REQUESTED:
+                    break
+                tasks.append(_safe_update_tv(collection, tv))
+
+                if len(tasks) >= CONCURRENCY * 2:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    tasks = []
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    # -------------------------
+    # RUN ALL UPDATES
+    # -------------------------
+    try:
+        await update_movies()
+        if not CANCEL_REQUESTED:
+            await update_tv()
+    except Exception as e:
+        LOGGER.exception(f"Error in fix_metadata run: {e}")
 
     if CANCEL_REQUESTED:
         return
 
+    elapsed = time.time() - start_time
+
     await status.edit_text(
         f"🎉 **Metadata Fix Completed!**\n"
         f"{progress_bar(DONE, TOTAL)}\n"
-        f"⏱ Time Taken: {format_eta(time.time() - start_time)}"
+        f"⏱ Time Taken: {format_eta(elapsed)}"
     )
