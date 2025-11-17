@@ -541,12 +541,12 @@ class Database:
 
 
     async def get_media_details(
-        self, imdb_id: str, db_index: int,
+        self, tmdb_id: int, db_index: int,
         season_number: Optional[int] = None, episode_number: Optional[int] = None
     ) -> Optional[dict]:
         db_key = f"storage_{db_index}"
         if episode_number is not None and season_number is not None:
-            tv_show = await self.dbs[db_key]["tv"].find_one({"imdb_id": imdb_id})
+            tv_show = await self.dbs[db_key]["tv"].find_one({"tmdb_id": tmdb_id})
             if not tv_show:
                 return None
             for season in tv_show.get("seasons", []):
@@ -555,7 +555,7 @@ class Database:
                         if episode.get("episode_number") == episode_number:
                             details = convert_objectid_to_str(episode)
                             details.update({
-                                "imdb_id": imdb_id,
+                                "tmdb_id": tmdb_id,
                                 "type": "tv",
                                 "season_number": season_number,
                                 "episode_number": episode_number,
@@ -565,14 +565,14 @@ class Database:
             return None
 
         elif season_number is not None:
-            tv_show = await self.dbs[db_key]["tv"].find_one({"imdb_id": imdb_id})
+            tv_show = await self.dbs[db_key]["tv"].find_one({"tmdb_id": tmdb_id})
             if not tv_show:
                 return None
             for season in tv_show.get("seasons", []):
                 if season.get("season_number") == season_number:
                     details = convert_objectid_to_str(season)
                     details.update({
-                        "imdb_id": imdb_id,
+                        "tmdb_id": tmdb_id,
                         "type": "tv",
                         "season_number": season_number
                     })
@@ -580,12 +580,12 @@ class Database:
             return None
 
         else:
-            tv_doc = await self.dbs[db_key]["tv"].find_one({"imdb_id": imdb_id})
+            tv_doc = await self.dbs[db_key]["tv"].find_one({"tmdb_id": tmdb_id})
             if tv_doc:
                 tv_doc = convert_objectid_to_str(tv_doc)
                 tv_doc["type"] = "tv"
                 return tv_doc
-            movie_doc = await self.dbs[db_key]["movie"].find_one({"imdb_id": imdb_id})
+            movie_doc = await self.dbs[db_key]["movie"].find_one({"tmdb_id": tmdb_id})
             if movie_doc:
                 movie_doc = convert_objectid_to_str(movie_doc)
                 movie_doc["type"] = "movie"

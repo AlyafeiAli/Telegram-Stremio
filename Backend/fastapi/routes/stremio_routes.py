@@ -27,7 +27,7 @@ GENRES = [
 # --- Helper Functions ---
 def convert_to_stremio_meta(item: dict) -> dict:
     media_type = "series" if item.get("media_type") == "tv" else "movie"
-    stremio_id = f"{item.get('imdb_id')}-{item.get('db_index')}"
+    stremio_id = f"{item.get('tmdb_id')}-{item.get('db_index')}"
     
     meta = {
         "id": stremio_id,
@@ -215,12 +215,12 @@ async def get_catalog(media_type: str, id: str, extra: Optional[str] = None):
 @router.get("/meta/{media_type}/{id}.json")
 async def get_meta(media_type: str, id: str):
     try:
-        imdb_id_str, db_index_str = id.split("-")
-        imdb_id, db_index = str(imdb_id_str), int(db_index_str)
+        tmdb_id_str, db_index_str = id.split("-")
+        tmdb_id, db_index = int(tmdb_id_str), int(db_index_str)
     except (ValueError, IndexError):
         raise HTTPException(status_code=400, detail="Invalid Stremio ID format")
 
-    media = await db.get_media_details(imdb_id=imdb_id, db_index=db_index)
+    media = await db.get_media_details(tmdb_id=tmdb_id, db_index=db_index)
     if not media:
         return {"meta": {}}
 
@@ -277,14 +277,14 @@ async def get_streams(media_type: str, id: str):
         base_id = parts[0]
         season_num = int(parts[1]) if len(parts) > 1 else None
         episode_num = int(parts[2]) if len(parts) > 2 else None
-        imdb_id_str, db_index_str = base_id.split("-")
-        imdb_id, db_index = str(imdb_id_str), int(db_index_str)
+        tmdb_id_str, db_index_str = base_id.split("-")
+        tmdb_id, db_index = int(tmdb_id_str), int(db_index_str)
 
     except (ValueError, IndexError):
         raise HTTPException(status_code=400, detail="Invalid Stremio ID format")
 
     media_details = await db.get_media_details(
-        imdb_id=imdb_id,
+        tmdb_id=tmdb_id,
         db_index=db_index,
         season_number=season_num,
         episode_number=episode_num
