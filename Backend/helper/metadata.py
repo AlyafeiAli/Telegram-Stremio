@@ -258,7 +258,9 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
             use_tmdb = True
 
     # TMDb fallback
-    if use_tmdb or (tmdb_id and not tv_details):
+    must_use_tmdb = use_tmdb or tv_details is None
+    if must_use_tmdb:
+        LOGGER.info(f"No IMDb result for '{title}' switch to TMDb")
         if not tmdb_id:
             tmdb_result = await safe_tmdb_search(title, "tv")
             if not tmdb_result:
@@ -364,7 +366,9 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
             LOGGER.warning(f"IMDb movie fetch failed [{title}]: {e}")
             use_tmdb = True
 
-    if use_tmdb or (tmdb_id and not movie_details):
+    must_use_tmdb = use_tmdb or movie_details is None
+    if must_use_tmdb:
+        LOGGER.info(f"No IMDb movie found for '{title}' switch to TMDb")
         if not tmdb_id:
             tmdb_result = await safe_tmdb_search(title, "movie", year)
             if not tmdb_result:
