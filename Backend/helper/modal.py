@@ -21,7 +21,7 @@ class Season(BaseModel):
     episodes: List[Episode] 
 
 class TVShowSchema(BaseModel):
-    tmdb_id: int 
+    tmdb_id: Optional[int] = None
     imdb_id: Optional[str] = None
     db_index: int 
     title: str 
@@ -39,7 +39,7 @@ class TVShowSchema(BaseModel):
     seasons: List[Season] 
 
 class MovieSchema(BaseModel):
-    tmdb_id: int
+    tmdb_id: Optional[int] = None
     imdb_id: Optional[str] = None
     db_index: int 
     title: str 
