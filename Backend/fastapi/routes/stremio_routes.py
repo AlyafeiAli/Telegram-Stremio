@@ -27,7 +27,7 @@ GENRES = [
 # --- Helper Functions ---
 def convert_to_stremio_meta(item: dict) -> dict:
     media_type = "series" if item.get("media_type") == "tv" else "movie"
-    stremio_id = f"{item.get('tmdb_id')}-{item.get('db_index')}"
+    stremio_id = f"{item.get('imdb_id')}-{item.get('db_index')}"
     
     meta = {
         "id": stremio_id,
@@ -36,15 +36,17 @@ def convert_to_stremio_meta(item: dict) -> dict:
         "poster": item.get("poster") or "",
         "logo": item.get("logo") or "",
         "year": item.get("release_year"),
+        "releaseInfo": item.get("release_year"),
+        "imdb_id": item.get("imdb_id", ""),
+        "moviedb_id": item.get("tmdb_id", ""),
         "background": item.get("backdrop") or "",
         "genres": item.get("genres") or [],
         "imdbRating": item.get("rating") or "",
         "description": item.get("description") or "",
+        "cast": item.get("cast") or [],
+        "runtime": item.get("runtime") or "",
     }
 
-    cast_list = item.get("cast") or []
-    if cast_list:
-        meta["cast"] = cast_list[:5]
     return meta
 
 
@@ -213,12 +215,12 @@ async def get_catalog(media_type: str, id: str, extra: Optional[str] = None):
 @router.get("/meta/{media_type}/{id}.json")
 async def get_meta(media_type: str, id: str):
     try:
-        tmdb_id_str, db_index_str = id.split("-")
-        tmdb_id, db_index = int(tmdb_id_str), int(db_index_str)
+        imdb_id_str, db_index_str = id.split("-")
+        imdb_id, db_index = str(imdb_id_str), int(db_index_str)
     except (ValueError, IndexError):
         raise HTTPException(status_code=400, detail="Invalid Stremio ID format")
 
-    media = await db.get_media_details(tmdb_id=tmdb_id, db_index=db_index)
+    media = await db.get_media_details(imdb_id=imdb_id, db_index=db_index)
     if not media:
         return {"meta": {}}
 
@@ -233,7 +235,12 @@ async def get_meta(media_type: str, id: str):
         "poster": media.get("poster", ""),
         "logo": media.get("logo", ""),
         "background": media.get("backdrop", ""),
-        "imdb_id": media.get("imdb_id", "")
+        "imdb_id": media.get("imdb_id", ""),
+        "releaseInfo": media.get("release_year"),
+        "moviedb_id": media.get("tmdb_id", ""),
+        "cast": media.get("cast") or [],
+        "runtime": media.get("runtime") or "",
+
     }
 
     # --- Add Episodes ---
@@ -260,12 +267,6 @@ async def get_meta(media_type: str, id: str):
                 })
 
         meta_obj["videos"] = videos
-
-    # --- Add cast ---
-    cast_list = media.get("cast") or []
-    if cast_list:
-        meta_obj["cast"] = cast_list[:10]
-
     return {"meta": meta_obj}
 
 
@@ -276,12 +277,14 @@ async def get_streams(media_type: str, id: str):
         base_id = parts[0]
         season_num = int(parts[1]) if len(parts) > 1 else None
         episode_num = int(parts[2]) if len(parts) > 2 else None
-        tmdb_id, db_index = map(int, base_id.split("-"))
+        imdb_id_str, db_index_str = base_id.split("-")
+        imdb_id, db_index = str(imdb_id_str), int(db_index_str)
+
     except (ValueError, IndexError):
         raise HTTPException(status_code=400, detail="Invalid Stremio ID format")
 
     media_details = await db.get_media_details(
-        tmdb_id=tmdb_id,
+        imdb_id=imdb_id,
         db_index=db_index,
         season_number=season_num,
         episode_number=episode_num

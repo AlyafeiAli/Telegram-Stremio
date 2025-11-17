@@ -33,6 +33,7 @@ class TVShowSchema(BaseModel):
     backdrop: Optional[str] = None 
     logo: Optional[str] = None
     cast: Optional[List[str]] = None
+    runtime: Optional[str] = None
     media_type: str
     updated_on: datetime = Field(default_factory=datetime.utcnow)
     seasons: List[Season] 
@@ -50,6 +51,7 @@ class MovieSchema(BaseModel):
     backdrop: Optional[str] = None
     logo: Optional[str] = None
     cast: Optional[List[str]] = None
+    runtime: Optional[str] = None
     media_type: str
     updated_on: datetime = Field(default_factory=datetime.utcnow) 
     telegram: Optional[List[QualityDetail]]

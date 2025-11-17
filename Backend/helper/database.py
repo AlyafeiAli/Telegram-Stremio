@@ -139,7 +139,10 @@ class Database:
 
             if len(results) >= page_size:
                 break
+
         return results, dbs_checked, total_count
+
+
 
     async def _move_document(
         self, collection_name: str, document: dict, old_db_index: int
@@ -190,6 +193,7 @@ class Database:
                 backdrop=metadata_info['backdrop'],
                 logo=metadata_info['logo'],
                 cast=metadata_info['cast'],
+                runtime=metadata_info['runtime'],
                 media_type=metadata_info['media_type'],
                 telegram=[QualityDetail(
                     quality=metadata_info['quality'],
@@ -213,6 +217,7 @@ class Database:
                 backdrop=metadata_info['backdrop'],
                 logo=metadata_info['logo'],
                 cast=metadata_info['cast'],
+                runtime=metadata_info['runtime'],
                 media_type=metadata_info['media_type'],
                 seasons=[Season(
                     season_number=metadata_info['season_number'],
@@ -536,12 +541,12 @@ class Database:
 
 
     async def get_media_details(
-        self, tmdb_id: int, db_index: int,
+        self, imdb_id: str, db_index: int,
         season_number: Optional[int] = None, episode_number: Optional[int] = None
     ) -> Optional[dict]:
         db_key = f"storage_{db_index}"
         if episode_number is not None and season_number is not None:
-            tv_show = await self.dbs[db_key]["tv"].find_one({"tmdb_id": tmdb_id})
+            tv_show = await self.dbs[db_key]["tv"].find_one({"imdb_id": imdb_id})
             if not tv_show:
                 return None
             for season in tv_show.get("seasons", []):
@@ -550,7 +555,7 @@ class Database:
                         if episode.get("episode_number") == episode_number:
                             details = convert_objectid_to_str(episode)
                             details.update({
-                                "tmdb_id": tmdb_id,
+                                "imdb_id": imdb_id,
                                 "type": "tv",
                                 "season_number": season_number,
                                 "episode_number": episode_number,
@@ -560,14 +565,14 @@ class Database:
             return None
 
         elif season_number is not None:
-            tv_show = await self.dbs[db_key]["tv"].find_one({"tmdb_id": tmdb_id})
+            tv_show = await self.dbs[db_key]["tv"].find_one({"imdb_id": imdb_id})
             if not tv_show:
                 return None
             for season in tv_show.get("seasons", []):
                 if season.get("season_number") == season_number:
                     details = convert_objectid_to_str(season)
                     details.update({
-                        "tmdb_id": tmdb_id,
+                        "imdb_id": imdb_id,
                         "type": "tv",
                         "season_number": season_number
                     })
@@ -575,12 +580,12 @@ class Database:
             return None
 
         else:
-            tv_doc = await self.dbs[db_key]["tv"].find_one({"tmdb_id": tmdb_id})
+            tv_doc = await self.dbs[db_key]["tv"].find_one({"imdb_id": imdb_id})
             if tv_doc:
                 tv_doc = convert_objectid_to_str(tv_doc)
                 tv_doc["type"] = "tv"
                 return tv_doc
-            movie_doc = await self.dbs[db_key]["movie"].find_one({"tmdb_id": tmdb_id})
+            movie_doc = await self.dbs[db_key]["movie"].find_one({"imdb_id": imdb_id})
             if movie_doc:
                 movie_doc = convert_objectid_to_str(movie_doc)
                 movie_doc["type"] = "movie"
@@ -655,7 +660,6 @@ class Database:
                     return False
             raise
 
-    # Delete a Movie or Tvshow completely
     async def delete_document(self, media_type: str, tmdb_id: int, db_index: int) -> bool:
         db_key = f"storage_{db_index}"
 
@@ -698,8 +702,6 @@ class Database:
         LOGGER.info(f"No document found with tmdb_id {tmdb_id}.")
         return False
 
-
-    # Delete a specific quality from movie
     async def delete_movie_quality(self, tmdb_id: int, db_index: int, quality: str) -> bool:
         db_key = f"storage_{db_index}"
         movie = await self.dbs[db_key]["movie"].find_one({"tmdb_id": tmdb_id})
@@ -730,7 +732,6 @@ class Database:
         result = await self.dbs[db_key]["movie"].replace_one({"tmdb_id": tmdb_id}, movie)
         return result.modified_count > 0
 
-    # Delete a specific episode from a TV show
     async def delete_tv_episode(self, tmdb_id: int, db_index: int, season_number: int, episode_number: int) -> bool:
         db_key = f"storage_{db_index}"
         tv = await self.dbs[db_key]["tv"].find_one({"tmdb_id": tmdb_id})
@@ -767,7 +768,6 @@ class Database:
         result = await self.dbs[db_key]["tv"].replace_one({"tmdb_id": tmdb_id}, tv)
         return result.modified_count > 0
 
-    # Delete a whole season from a TV show
     async def delete_tv_season(self, tmdb_id: int, db_index: int, season_number: int) -> bool:
         db_key = f"storage_{db_index}"
         tv = await self.dbs[db_key]["tv"].find_one({"tmdb_id": tmdb_id})
@@ -800,7 +800,6 @@ class Database:
         result = await self.dbs[db_key]["tv"].replace_one({"tmdb_id": tmdb_id}, tv)
         return result.modified_count > 0
 
-    # Delete a specific quality from a given TV episode
     async def delete_tv_quality(self, tmdb_id: int, db_index: int, season_number: int, episode_number: int, quality: str) -> bool:
         db_key = f"storage_{db_index}"
         tv = await self.dbs[db_key]["tv"].find_one({"tmdb_id": tmdb_id})
