@@ -57,6 +57,7 @@ def format_imdb_images(imdb_id: str) -> dict:
     }
 
 def extract_default_id(url: str) -> str | None:
+    """Extract IMDb or TMDb ID from string."""
     # IMDb
     imdb_match = re.search(r'/title/(tt\d+)', url)
     if imdb_match:
@@ -310,7 +311,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
         ep_details = {}
 
     return {
-        "tmdb_id": tv_details.get("moviedb_id", ""),
+        "tmdb_id": tv_details.get("moviedb_id") or imdb_id.replace("tt", ""),
         "imdb_id": imdb_id,
         "title": tv_details.get("title", title),
         "year": tv_details.get("releaseDetailed", {}).get("year", 0),
@@ -403,7 +404,7 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
         movie_details = {}
 
     return {
-        "tmdb_id": movie_details.get("moviedb_id", ""),
+        "tmdb_id": movie_details.get("moviedb_id") or imdb_id.replace("tt", ""),
         "imdb_id": imdb_id,
         "title": movie_details.get("title", title),
         "year": movie_details.get("releaseDetailed", {}).get("year", 0),
