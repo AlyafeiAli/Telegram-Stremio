@@ -57,6 +57,7 @@ def format_imdb_images(imdb_id: str) -> dict:
     }
 
 def extract_default_id(url: str) -> str | None:
+    """Extract IMDb or TMDb ID from string."""
     # IMDb
     imdb_match = re.search(r'/title/(tt\d+)', url)
     if imdb_match:
@@ -188,7 +189,7 @@ async def metadata(filename: str, channel: int, msg_id) -> dict | None:
         LOGGER.info(f"No title parsed from: {filename} (parsed={parsed})")
         return None
 
-
+    # Extract default ID
     default_id = None
     try:
         default_id = extract_default_id(Backend.USE_DEFAULT_ID)
@@ -257,9 +258,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
             use_tmdb = True
 
     # TMDb fallback
-    must_use_tmdb = use_tmdb or tv_details is None
-    if must_use_tmdb:
-        LOGGER.info(f"No IMDb result for '{title}' switch to TMDb")
+    if use_tmdb or (tmdb_id and not tv_details):
         if not tmdb_id:
             tmdb_result = await safe_tmdb_search(title, "tv")
             if not tmdb_result:
@@ -365,9 +364,7 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
             LOGGER.warning(f"IMDb movie fetch failed [{title}]: {e}")
             use_tmdb = True
 
-    must_use_tmdb = use_tmdb or movie_details is None
-    if must_use_tmdb:
-        LOGGER.info(f"No IMDb movie found for '{title}' switch to TMDb")
+    if use_tmdb or (tmdb_id and not movie_details):
         if not tmdb_id:
             tmdb_result = await safe_tmdb_search(title, "movie", year)
             if not tmdb_result:
