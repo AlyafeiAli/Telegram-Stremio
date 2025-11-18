@@ -340,8 +340,10 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
     use_tmdb = False
 
     if default_id:
+        LOGGER.info(default_id)
         if str(default_id).startswith("tt"):
             imdb_id = default_id
+            LOGGER.info(imdb_id)
         elif str(default_id).isdigit():
             tmdb_id = int(default_id)
             use_tmdb = True
@@ -353,12 +355,14 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
     movie_details = None
 
     if imdb_id and not use_tmdb:
+
         try:
             if imdb_id in IMDB_CACHE:
                 movie_details = IMDB_CACHE[imdb_id]
             else:
                 async with API_SEMAPHORE:
                     movie_details = await get_detail(imdb_id=imdb_id, media_type="movie")
+                    LOGGER.info(movie_details)
                 IMDB_CACHE[imdb_id] = movie_details
         except Exception as e:
             LOGGER.warning(f"IMDb movie fetch failed [{title}]: {e}")
