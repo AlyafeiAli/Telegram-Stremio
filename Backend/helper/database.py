@@ -245,9 +245,8 @@ class Database:
             LOGGER.error(f"Validation error: {e}")
             return None
 
+        imdb_id = movie_dict["imdb_id"]
         tmdb_id = movie_dict["tmdb_id"]
-        
-
         title = movie_dict["title"]
         release_year = movie_dict["release_year"]
         quality_to_update = movie_dict["telegram"][0]
@@ -262,9 +261,16 @@ class Database:
         
         for db_index in range(1, total_storage_dbs + 1):
             db_key = f"storage_{db_index}"
-            movie = await self.dbs[db_key]["movie"].find_one(
-                    {"title": title, "release_year": release_year}
-            )
+            movie = None
+            if imdb_id:
+                movie = await self.dbs[db_key]["movie"].find_one({"imdb_id": imdb_id})
+            if not movie and tmdb_id:
+                movie = await self.dbs[db_key]["movie"].find_one({"tmdb_id": tmdb_id})
+            if not movie and title and release_year:
+                movie = await self.dbs[db_key]["movie"].find_one({
+                    "title": title, 
+                    "release_year": release_year
+                })
             if movie:
                 existing_db_key = db_key
                 existing_db_index = db_index
@@ -326,10 +332,9 @@ class Database:
         except ValidationError as e:
             LOGGER.error(f"Validation error: {e}")
             return None
-
-        tmdb_id = tv_show_dict["tmdb_id"]
         
-
+        imdb_id = tv_show_dict.get("imdb_id")
+        tmdb_id = tv_show_dict.get("tmdb_id")
         title = tv_show_dict["title"]
         release_year = tv_show_dict["release_year"]
         current_db_key = f"storage_{self.current_db_index}"
@@ -341,9 +346,16 @@ class Database:
 
         for db_index in range(1, total_storage_dbs + 1):
             db_key = f"storage_{db_index}"
-            tv = await self.dbs[db_key]["tv"].find_one(
-                    {"title": title, "release_year": release_year}
-            )
+            tv = None
+            if imdb_id:
+                tv = await self.dbs[db_key]["tv"].find_one({"imdb_id": imdb_id})
+            if not tv and tmdb_id:
+                tv = await self.dbs[db_key]["tv"].find_one({"tmdb_id": tmdb_id})
+            if not tv and title and release_year:
+                tv = await self.dbs[db_key]["tv"].find_one({
+                    "title": title,
+                    "release_year": release_year
+                })
             if tv:
                 existing_db_key = db_key
                 existing_db_index = db_index

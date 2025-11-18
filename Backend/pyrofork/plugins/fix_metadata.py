@@ -41,17 +41,18 @@ async def cancel_fix(_, query):
     await query.answer("Cancelled")
 
 # -------------------------------
-# MAIN COMMAND
+# MAIN COMMAND (REWRITTEN - Balanced)
 # -------------------------------
 @Client.on_message(filters.command("fixmetadata") & filters.private & CustomFilters.owner, group=10)
 async def fix_metadata_handler(_, message):
     global CANCEL_REQUESTED
     CANCEL_REQUESTED = False
 
-    # Count total items
+    # -------------------------
+    # Gather totals quickly (non-blocking)
+    # -------------------------
     total_movies = 0
     total_tv = 0
-
     for i in range(1, db.current_db_index + 1):
         key = f"storage_{i}"
         total_movies += await db.dbs[key]["movie"].count_documents({})
@@ -68,331 +69,372 @@ async def fix_metadata_handler(_, message):
         ])
     )
 
-    CONCURRENCY = 20
-    semaphore = asyncio.Semaphore(CONCURRENCY)
+    # -------------------------
+    # Tunables
+    # -------------------------
+    CONCURRENCY = 20                              
+    TASK_BATCH = CONCURRENCY * 2                  
+    PROGRESS_INTERVAL = 5.0                       
 
-    # -------------------------
-    # MOVIE UPDATE
-    # -------------------------
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    meta_cache = {}
+    last_progress_edit = start_time
+
+    async def cached_fetch_movie(title, year, default_id, encoded_string=None, quality=None):
+        if default_id:
+            k = ("movie", str(default_id))
+        else:
+            k = ("movie", f"title::{title or ''}::year::{year or ''}")
+
+        if k in meta_cache:
+            return meta_cache[k]
+
+        async with semaphore:
+            try:
+                meta = await fetch_movie_metadata(title=title, encoded_string=encoded_string, year=year, quality=quality, default_id=default_id)
+            except Exception as e:
+                LOGGER.exception(f"fetch_movie_metadata error for {title} ({default_id}): {e}")
+                meta = None
+
+        meta_cache[k] = meta
+        return meta
+
+    async def cached_fetch_tv(title, season, episode, year, default_id, encoded_string=None, quality=None):
+        if default_id:
+            k = ("tv", str(default_id), int(season), int(episode))
+        else:
+            k = ("tv", f"title::{title or ''}::year::{year or ''}", int(season), int(episode))
+
+        if k in meta_cache:
+            return meta_cache[k]
+
+        async with semaphore:
+            try:
+                meta = await fetch_tv_metadata(title=title, season=season, episode=episode,
+                                               encoded_string=encoded_string, year=year, quality=quality, default_id=default_id)
+            except Exception as e:
+                LOGGER.exception(f"fetch_tv_metadata error for {title} S{season}E{episode} ({default_id}): {e}")
+                meta = None
+
+        meta_cache[k] = meta
+        return meta
+
 
     async def _safe_update_movie(collection, movie_doc):
-        nonlocal DONE
+        nonlocal DONE, last_progress_edit
+
         if CANCEL_REQUESTED:
             return
+        try:
+            doc_id = movie_doc.get("_id")
+            imdb_id = movie_doc.get("imdb_id")
+            tmdb_id = movie_doc.get("tmdb_id")
+            title = movie_doc.get("title")
+            year = movie_doc.get("release_year")
 
-        async with semaphore:
-            try:
-                doc_id = movie_doc.get("_id")
-                imdb_id = movie_doc.get("imdb_id")
-                tmdb_id = movie_doc.get("tmdb_id")
-                title = movie_doc.get("title")
-                year = movie_doc.get("release_year")
-                
-                meta_1 = None
-                meta_2 = None
-                
+            meta_primary = None
+            meta_secondary = None
 
-                if imdb_id:
-                    meta_1 = await fetch_movie_metadata(
-                        title=title, encoded_string=None, year=year, quality=None, default_id=imdb_id
-                    )
-                    fetched_tmdb_id = meta_1.get("tmdb_id") if meta_1 else None
-                    if tmdb_id or fetched_tmdb_id:
-                        meta_2 = await fetch_movie_metadata(
-                            title=title, encoded_string=None, year=year, quality=None, default_id=(tmdb_id or fetched_tmdb_id)
-                        )
+            if imdb_id:
+                meta_primary = await cached_fetch_movie(title, year, imdb_id)
+                fetched_tmdb = meta_primary.get("tmdb_id") if meta_primary else None
+                if (tmdb_id or fetched_tmdb) and (not all_fields_present(meta_primary)):
+                    meta_secondary = await cached_fetch_movie(title, year, (tmdb_id or fetched_tmdb))
+            elif tmdb_id:
+                meta_primary = await cached_fetch_movie(title, year, tmdb_id)
+                fetched_imdb = meta_primary.get("imdb_id") if meta_primary else None
+                if fetched_imdb and (not all_fields_present(meta_primary)):
+                    meta_secondary = await cached_fetch_movie(title, year, fetched_imdb)
+            else:
+                meta_primary = await cached_fetch_movie(title, year, None)
+                if meta_primary:
+                    fetched_imdb = meta_primary.get("imdb_id")
+                    fetched_tmdb = meta_primary.get("tmdb_id")
+                    if fetched_imdb and (not all_fields_present(meta_primary)):
+                        meta_secondary = await cached_fetch_movie(title, year, fetched_imdb)
+                    elif fetched_tmdb and (not all_fields_present(meta_primary)):
+                        meta_secondary = await cached_fetch_movie(title, year, fetched_tmdb)
 
-                elif tmdb_id:
-                    meta_1 = await fetch_movie_metadata(
-                        title=title, encoded_string=None, year=year, quality=None, default_id=tmdb_id
-                    )
-                    fetched_imdb_id = meta_1.get("imdb_id") if meta_1 else None
-                    if fetched_imdb_id:
-                        meta_2 = await fetch_movie_metadata(
-                            title=title, encoded_string=None, year=year, quality=None, default_id=fetched_imdb_id
-                        )
-                else:
-                    meta_1 = await fetch_movie_metadata(
-                        title=title, encoded_string=None, year=year, quality=None, default_id=None
-                    )
+            update_query = {}
+            current = dict(movie_doc)
 
-                    fetched_imdb_id = meta_1.get("imdb_id") if meta_1 else None
-                    fetched_tmdb_id = meta_1.get("tmdb_id") if meta_1 else None
+            api_map = {
+                "imdb_id": "imdb_id",
+                "tmdb_id": "tmdb_id",
+                "rate": "rating",
+                "cast": "cast",
+                "description": "description",
+                "genres": "genres",
+                "poster": "poster",
+                "backdrop": "backdrop",
+                "runtime": "runtime",
+                "logo": "logo"
+            }
 
-                    if fetched_imdb_id:
-                         meta_2 = await fetch_movie_metadata(
-                            title=title, encoded_string=None, year=year, quality=None, default_id=fetched_imdb_id
-                        )
-                    elif fetched_tmdb_id:
-                        meta_2 = await fetch_movie_metadata(
-                            title=title, encoded_string=None, year=year, quality=None, default_id=fetched_tmdb_id
-                        )
-                
-                final_set_query = {}
-                current_data = dict(movie_doc)
-                api_map = {
-                    "imdb_id": "imdb_id",
-                    "tmdb_id": "tmdb_id",
-                    "rate": "rating",
-                    "cast": "cast",
-                    "description": "description",
-                    "genres": "genres",
-                    "poster": "poster",
-                    "backdrop": "backdrop",
-                    "runtime": "runtime",
-                    "logo": "logo"
-                }
-                for meta in [meta_1, meta_2]:
-                    if not meta:
+            for meta in (meta_primary, meta_secondary):
+                if not meta:
+                    continue
+                for api_key, db_key in api_map.items():
+                    new_val = meta.get(api_key)
+                    if new_val is None:
                         continue
 
-                    for api_key, db_key in api_map.items():
-                        new_val = meta.get(api_key)
-                        is_empty = False
-                        if db_key == "rating":
-                            is_empty = not current_data.get(db_key) or current_data.get(db_key) == 0
-                        else:
-                            is_empty = not current_data.get(db_key)
-                        if is_empty and new_val:
-                            final_set_query[db_key] = new_val
-                            current_data[db_key] = new_val
-                
-                if final_set_query:
-                    if doc_id:
-                        await collection.update_one(
-                            {"_id": doc_id},
-                            {"$set": final_set_query}
-                        )
+                    if db_key == "rating":
+                        is_empty = (not current.get(db_key)) or current.get(db_key) == 0
                     else:
-                        await collection.update_one(
-                            {"imdb_id": movie_doc.get("imdb_id")}, 
-                            {"$set": final_set_query}
-                        )
+                        is_empty = not current.get(db_key)
+                    # # If want to add missing data
+                    # if is_empty and new_val:
+                    #     update_query[db_key] = new_val
+                    #     current[db_key] = new_val
+                    # # If want to add complete data
+                    if new_val is not None:
+                        update_query[db_key] = new_val
+                        current[db_key] = new_val
 
-                DONE += 1
 
-            except Exception as e:
-                LOGGER.exception(f"Error updating movie {movie_doc.get('title')}: {e}")
-                DONE += 1
+            if update_query:
+                filter_q = {"_id": doc_id} if doc_id else {"imdb_id": imdb_id}
+                try:
+                    await collection.update_one(filter_q, {"$set": update_query})
+                except Exception as e:
+                    LOGGER.exception(f"DB update failed for movie {title}: {e}")
 
-    # -------------------------
-    # TV UPDATE
-    # -------------------------
+            DONE += 1
+
+            now = time.time()
+            if now - last_progress_edit > PROGRESS_INTERVAL:
+                last_progress_edit = now
+                try:
+                    await status.edit_text(
+                        f"⏳ Fixing metadata...\n{progress_bar(DONE, TOTAL)}\n⏱ Elapsed: {format_eta(now - start_time)}"
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            LOGGER.exception(f"Error updating movie {movie_doc.get('title')}: {e}")
+            DONE += 1
 
     async def _safe_update_tv(collection, tv_doc):
-        nonlocal DONE
+        nonlocal DONE, last_progress_edit
+
         if CANCEL_REQUESTED:
             return
 
-        async with semaphore:
-            try:
-                doc_id = tv_doc.get("_id")
-                imdb_id = tv_doc.get("imdb_id")
-                tmdb_id = tv_doc.get("tmdb_id")
-                title = tv_doc.get("title")
-                year = tv_doc.get("release_year")
-                
-                meta_1 = None
-                meta_2 = None
-                if imdb_id:
-                    meta_1 = await fetch_tv_metadata(
-                        title=title, season=1, episode=1, encoded_string=None, year=year, quality=None, default_id=imdb_id
-                    )
-                    fetched_tmdb_id = meta_1.get("tmdb_id") if meta_1 else None
-                    if tmdb_id or fetched_tmdb_id:
-                        meta_2 = await fetch_tv_metadata(
-                            title=title, season=1, episode=1, encoded_string=None, year=year, quality=None, default_id=(tmdb_id or fetched_tmdb_id)
-                        )
-                elif tmdb_id:
-                    meta_1 = await fetch_tv_metadata(
-                        title=title, season=1, episode=1, encoded_string=None, year=year, quality=None, default_id=tmdb_id
-                    )
-                    fetched_imdb_id = meta_1.get("imdb_id") if meta_1 else None
-                    if fetched_imdb_id:
-                        meta_2 = await fetch_tv_metadata(
-                            title=title, season=1, episode=1, encoded_string=None, year=year, quality=None, default_id=fetched_imdb_id
-                        )
-                else:
-                    meta_1 = await fetch_tv_metadata(
-                        title=title, season=1, episode=1, encoded_string=None, year=year, quality=None, default_id=None # Title search
-                    )
-                    fetched_imdb_id = meta_1.get("imdb_id") if meta_1 else None
-                    fetched_tmdb_id = meta_1.get("tmdb_id") if meta_1 else None
+        try:
+            doc_id = tv_doc.get("_id")
+            imdb_id = tv_doc.get("imdb_id")
+            tmdb_id = tv_doc.get("tmdb_id")
+            title = tv_doc.get("title")
+            year = tv_doc.get("release_year")
 
-                    if fetched_imdb_id:
-                         meta_2 = await fetch_tv_metadata(
-                            title=title, season=1, episode=1, encoded_string=None, year=year, quality=None, default_id=fetched_imdb_id
-                        )
-                    elif fetched_tmdb_id:
-                        meta_2 = await fetch_tv_metadata(
-                            title=title, season=1, episode=1, encoded_string=None, year=year, quality=None, default_id=fetched_tmdb_id
-                        )
+            meta_primary = None
+            meta_secondary = None
 
-                final_set_query = {}
-                current_data = dict(tv_doc)
-                api_map = {
-                    "imdb_id": "imdb_id",
-                    "tmdb_id": "tmdb_id",
-                    "rate": "rating",
-                    "cast": "cast",
-                    "description": "description",
-                    "genres": "genres",
-                    "poster": "poster",
-                    "backdrop": "backdrop",
-                    "runtime": "runtime",
-                    "logo": "logo"
-                }
-                
-                for meta in [meta_1, meta_2]:
-                    if not meta:
+            if imdb_id:
+                meta_primary = await cached_fetch_tv(title, 1, 1, year, imdb_id)
+                fetched_tmdb = meta_primary.get("tmdb_id") if meta_primary else None
+                if (tmdb_id or fetched_tmdb) and (not all_fields_present(meta_primary)):
+                    meta_secondary = await cached_fetch_tv(title, 1, 1, year, (tmdb_id or fetched_tmdb))
+            elif tmdb_id:
+                meta_primary = await cached_fetch_tv(title, 1, 1, year, tmdb_id)
+                fetched_imdb = meta_primary.get("imdb_id") if meta_primary else None
+                if fetched_imdb and (not all_fields_present(meta_primary)):
+                    meta_secondary = await cached_fetch_tv(title, 1, 1, year, fetched_imdb)
+            else:
+                meta_primary = await cached_fetch_tv(title, 1, 1, year, None)
+                if meta_primary:
+                    fetched_imdb = meta_primary.get("imdb_id")
+                    fetched_tmdb = meta_primary.get("tmdb_id")
+                    if fetched_imdb and (not all_fields_present(meta_primary)):
+                        meta_secondary = await cached_fetch_tv(title, 1, 1, year, fetched_imdb)
+                    elif fetched_tmdb and (not all_fields_present(meta_primary)):
+                        meta_secondary = await cached_fetch_tv(title, 1, 1, year, fetched_tmdb)
+
+            update_query = {}
+            current = dict(tv_doc)
+            api_map = {
+                "imdb_id": "imdb_id",
+                "tmdb_id": "tmdb_id",
+                "rate": "rating",
+                "cast": "cast",
+                "description": "description",
+                "genres": "genres",
+                "poster": "poster",
+                "backdrop": "backdrop",
+                "runtime": "runtime",
+                "logo": "logo"
+            }
+
+            for meta in (meta_primary, meta_secondary):
+                if not meta:
+                    continue
+                for api_key, db_key in api_map.items():
+                    new_val = meta.get(api_key)
+                    if new_val is None:
+                        continue
+                    if db_key == "rating":
+                        is_empty = (not current.get(db_key)) or current.get(db_key) == 0
+                    else:
+                        is_empty = not current.get(db_key)
+                    # # If want to add missing data
+                    # if is_empty and new_val:
+                    #     update_query[db_key] = new_val
+                    #     current[db_key] = new_val
+                    # # If want to add complete data
+                    if new_val is not None:
+                        update_query[db_key] = new_val
+                        current[db_key] = new_val
+
+
+            if update_query:
+                filter_q = {"_id": doc_id} if doc_id else {"imdb_id": imdb_id}
+                try:
+                    await collection.update_one(filter_q, {"$set": update_query})
+                except Exception as e:
+                    LOGGER.exception(f"DB update failed for TV {title}: {e}")
+
+            final_imdb = current.get("imdb_id")
+            if not final_imdb:
+                DONE += 1
+                return
+
+            ep_tasks = []
+            for season in tv_doc.get("seasons", []):
+                s_num = season.get("season_number")
+                for ep in season.get("episodes", []):
+                    e_num = ep.get("episode_number")
+
+                    # skip if episode appears complete
+                    if ep.get("overview") and ep.get("released") and ep.get("episode_backdrop"):
                         continue
 
-                    for api_key, db_key in api_map.items():
-                        new_val = meta.get(api_key)
-                        
-                        is_empty = False
-                        if db_key == "rating":
-                            is_empty = not current_data.get(db_key) or current_data.get(db_key) == 0
-                        else:
-                            is_empty = not current_data.get(db_key)
-                        
-                        if is_empty and new_val:
-                            final_set_query[db_key] = new_val
-                            current_data[db_key] = new_val
-                if final_set_query:
-                    if doc_id:
-                        await collection.update_one(
-                            {"_id": doc_id},
-                            {"$set": final_set_query}
-                        )
-                    else:
-                        await collection.update_one(
-                            {"imdb_id": tv_doc.get("imdb_id")},
-                            {"$set": final_set_query}
-                        )
-                tasks = []
+                    async def ep_task(sn=s_num, en=e_num):
+                        try:
+                            meta = await cached_fetch_tv(title, sn, en, year, final_imdb)
+                            if not meta:
+                                return
 
-                final_imdb_id = current_data.get("imdb_id")
-                
-                if final_imdb_id:
-                    for season in tv_doc.get("seasons", []):
-                        s_num = season.get("season_number")
+                            ep_update = {}
+                            if meta.get("episode_overview"):
+                                ep_update["seasons.$[s].episodes.$[e].overview"] = meta["episode_overview"]
+                            if meta.get("episode_released"):
+                                ep_update["seasons.$[s].episodes.$[e].released"] = meta["episode_released"]
+                            if meta.get("episode_backdrop"):
+                                ep_update["seasons.$[s].episodes.$[e].episode_backdrop"] = meta["episode_backdrop"]
 
-                        for ep in season.get("episodes", []):
-                            e_num = ep.get("episode_number")
+                            if ep_update:
+                                filt = {"_id": doc_id} if doc_id else {"imdb_id": final_imdb}
+                                await collection.update_one(
+                                    filt,
+                                    {"$set": ep_update},
+                                    array_filters=[
+                                        {"s.season_number": sn},
+                                        {"e.episode_number": en}
+                                    ]
+                                )
+                        except Exception as e:
+                            LOGGER.exception(f"Error updating episode {title} S{sn}E{en}: {e}")
 
-                            if ep.get("overview") and ep.get("released") and ep.get("episode_backdrop"):
-                                continue
+                    ep_tasks.append(ep_task())
 
-                            async def ep_task(s_local=s_num, e_local=e_num):
-                                try:
-                                    ep_meta = await fetch_tv_metadata(
-                                        title=title,
-                                        season=s_local,
-                                        episode=e_local,
-                                        encoded_string=None,
-                                        year=year,
-                                        quality=None,
-                                        default_id=final_imdb_id  
-                                    )
+            for i in range(0, len(ep_tasks), TASK_BATCH):
+                if CANCEL_REQUESTED:
+                    break
+                batch = ep_tasks[i:i+TASK_BATCH]
+                running = [asyncio.create_task(t) for t in batch]
+                await asyncio.gather(*running, return_exceptions=True)
 
-                                    if ep_meta:
-                                        ep_update_query = {}
-                                        if ep_meta.get("episode_overview"):
-                                            ep_update_query["seasons.$[s].episodes.$[e].overview"] = ep_meta.get("episode_overview")
-                                        if ep_meta.get("episode_released"):
-                                            ep_update_query["seasons.$[s].episodes.$[e].released"] = ep_meta.get("episode_released")
-                                        if ep_meta.get("episode_backdrop"):
-                                            ep_update_query["seasons.$[s].episodes.$[e].episode_backdrop"] = ep_meta.get("episode_backdrop")
-                                        
-                                        if ep_update_query:
-                                            filter_query = {"_id": doc_id} if doc_id else {"imdb_id": tv_doc.get("imdb_id")}
-                                            await collection.update_one(
-                                                filter_query,
-                                                {"$set": ep_update_query},
-                                                array_filters=[
-                                                    {"s.season_number": s_local},
-                                                    {"e.episode_number": e_local}
-                                                ]
-                                            )
-                                except Exception as e:
-                                    LOGGER.exception(f"Error updating episode {title} S{s_local}E{e_local}: {e}")
+            DONE += 1
 
-                            tasks.append(asyncio.create_task(ep_task()))
+            now = time.time()
+            if now - last_progress_edit > PROGRESS_INTERVAL:
+                last_progress_edit = now
+                try:
+                    await status.edit_text(
+                        f"⏳ Fixing metadata...\n{progress_bar(DONE, TOTAL)}\n⏱ Elapsed: {format_eta(now - start_time)}"
+                    )
+                except Exception:
+                    pass
 
-                    if tasks:
-                        for i in range(0, len(tasks), CONCURRENCY):
-                            await asyncio.gather(*tasks[i:i+CONCURRENCY], return_exceptions=True)
+        except Exception as e:
+            LOGGER.exception(f"Error updating TV show {tv_doc.get('title')}: {e}")
+            DONE += 1
 
-                DONE += 1
+    def all_fields_present(meta: dict) -> bool:
+        if not meta:
+            return False
 
-            except Exception as e:
-                LOGGER.exception(f"Error updating TV show {tv_doc.get('title')}: {e}")
-                DONE += 1
-    # -------------------------
-    # UPDATE MOVIES
-    # -------------------------
+        if not (meta.get("poster") or meta.get("backdrop")):
+            return False
+
+        has_desc = meta.get("description") or meta.get("genres") or meta.get("cast")
+        if not has_desc:
+            return False
+
+        if meta.get("rate") in [0, None]:
+            return False
+
+        if meta.get("runtime") in [0, None]:
+            return False
+
+        return True
+
+
+
     async def update_movies():
         tasks = []
         for i in range(1, db.current_db_index + 1):
             if CANCEL_REQUESTED:
                 break
-
             collection = db.dbs[f"storage_{i}"]["movie"]
             cursor = collection.find({})
-
             async for movie in cursor:
                 if CANCEL_REQUESTED:
                     break
-
                 tasks.append(_safe_update_movie(collection, movie))
-
-                if len(tasks) >= CONCURRENCY * 2:
+                if len(tasks) >= TASK_BATCH:
                     await asyncio.gather(*tasks, return_exceptions=True)
                     tasks = []
-
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    # -------------------------
-    # UPDATE TV
-    # -------------------------
-    async def update_tv():
+    async def update_tv_shows():
         tasks = []
         for i in range(1, db.current_db_index + 1):
-
+            if CANCEL_REQUESTED:
+                break
             collection = db.dbs[f"storage_{i}"]["tv"]
             cursor = collection.find({})
-
             async for tv in cursor:
                 if CANCEL_REQUESTED:
                     break
-
                 tasks.append(_safe_update_tv(collection, tv))
-
-                if len(tasks) >= CONCURRENCY * 2:
+                if len(tasks) >= TASK_BATCH:
                     await asyncio.gather(*tasks, return_exceptions=True)
                     tasks = []
-
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    # -------------------------
-    # RUN ALL UPDATES
-    # -------------------------
     try:
-        await update_movies()
-        if not CANCEL_REQUESTED:
-            await update_tv()
+        await asyncio.gather(update_movies(), update_tv_shows())
     except Exception as e:
         LOGGER.exception(f"Error in fix_metadata run: {e}")
 
     if CANCEL_REQUESTED:
+        try:
+            await status.edit_text("❌ Metadata fixing cancelled by user.")
+        except Exception:
+            pass
         return
 
     elapsed = time.time() - start_time
-    await status.edit_text(
-        f"🎉 **Metadata Fix Completed!**\n"
-        f"{progress_bar(DONE, TOTAL)}\n"
-        f"⏱ Time Taken: {format_eta(elapsed)}"
-    )
+    try:
+        await status.edit_text(
+            f"🎉 **Metadata Fix Completed!**\n"
+            f"{progress_bar(DONE, TOTAL)}\n"
+            f"⏱ Time Taken: {format_eta(elapsed)}"
+        )
+    except Exception:
+        pass
