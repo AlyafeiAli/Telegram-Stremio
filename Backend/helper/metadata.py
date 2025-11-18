@@ -57,7 +57,6 @@ def format_imdb_images(imdb_id: str) -> dict:
     }
 
 def extract_default_id(url: str) -> str | None:
-    """Extract IMDb or TMDb ID from string."""
     # IMDb
     imdb_match = re.search(r'/title/(tt\d+)', url)
     if imdb_match:
@@ -189,7 +188,7 @@ async def metadata(filename: str, channel: int, msg_id) -> dict | None:
         LOGGER.info(f"No title parsed from: {filename} (parsed={parsed})")
         return None
 
-    # Extract default ID
+
     default_id = None
     try:
         default_id = extract_default_id(Backend.USE_DEFAULT_ID)
@@ -243,7 +242,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
                 tv_details = IMDB_CACHE[imdb_id]
             else:
                 async with API_SEMAPHORE:
-                    tv_details = await get_detail(imdb_id=imdb_id)
+                    tv_details = await get_detail(imdb_id=imdb_id, media_type="tvSeries")
                 IMDB_CACHE[imdb_id] = tv_details
 
             cache_key = f"{imdb_id}::{season}::{episode}"
@@ -297,7 +296,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
             ),
             "season_number": season,
             "episode_number": episode,
-            "episode_title": getattr(ep_details, "name", f"S{season}E{episode}") if ep_details else f"{tv_details.name} S{season}E{episode}",
+            "episode_title": getattr(ep_details, "name", f"S{season}E{episode}") if ep_details else f"Epidose {episode}",
             "episode_backdrop": format_tmdb_image(getattr(ep_details, "still_path", None), "original") if ep_details else "",
             "episode_overview": getattr(ep_details, "overview", "") if ep_details else "",
             "episode_released": (str(ep_details.air_date.strftime("%Y-%m-%dT05:00:00.000Z")) if getattr(ep_details, "air_date", None) else ""),
@@ -313,7 +312,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
         ep_details = {}
 
     return {
-        "tmdb_id": tv_details.get("moviedb_id") or imdb_id.replace("tt", ""),
+        "tmdb_id": tv_details.get("moviedb_id") or None,
         "imdb_id": imdb_id,
         "title": tv_details.get("title", title),
         "year": tv_details.get("releaseDetailed", {}).get("year", 0),
@@ -328,7 +327,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
         "media_type": "tv",
         "season_number": season,
         "episode_number": episode,
-        "episode_title": ep_details.get("title", f"S{season}E{episode}") if ep_details else f"{tv_details.get('title', title)} S{season}E{episode}",
+        "episode_title": ep_details.get("title", f"S{season}E{episode}") if ep_details else f"Episode {episode}",
         "episode_backdrop": ep_details.get("image", "") if ep_details else "",
         "episode_overview": ep_details.get("plot", "") if ep_details else "",
         "episode_released": str(ep_details.get("released", "")) if ep_details else "",
@@ -360,7 +359,7 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
                 movie_details = IMDB_CACHE[imdb_id]
             else:
                 async with API_SEMAPHORE:
-                    movie_details = await get_detail(imdb_id=imdb_id)
+                    movie_details = await get_detail(imdb_id=imdb_id, media_type="movie")
                 IMDB_CACHE[imdb_id] = movie_details
         except Exception as e:
             LOGGER.warning(f"IMDb movie fetch failed [{title}]: {e}")
@@ -408,7 +407,7 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
         movie_details = {}
 
     return {
-        "tmdb_id": movie_details.get("moviedb_id") or imdb_id.replace("tt", ""),
+        "tmdb_id": movie_details.get("moviedb_id") or None,
         "imdb_id": imdb_id,
         "title": movie_details.get("title", title),
         "year": movie_details.get("releaseDetailed", {}).get("year", 0),

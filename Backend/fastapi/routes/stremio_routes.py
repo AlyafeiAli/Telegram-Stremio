@@ -4,7 +4,7 @@ from urllib.parse import unquote
 from Backend.config import Telegram
 from Backend import db, __version__
 import PTN
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 
 # --- Configuration ---
@@ -246,7 +246,8 @@ async def get_meta(media_type: str, id: str):
     # --- Add Episodes ---
     if media_type == "series" and "seasons" in media:
 
-        current_release = datetime.now(timezone.utc).isoformat()
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+
         videos = []
 
         for season in sorted(media.get("seasons", []), key=lambda s: s.get("season_number")):
@@ -260,9 +261,8 @@ async def get_meta(media_type: str, id: str):
                     "season": season.get("season_number"),
                     "episode": episode.get("episode_number"),
                     "overview": episode.get("overview") or "No description available for this episode yet.",
-                    "released": episode.get("released") or current_release,
-                    "thumbnail": episode.get("episode_backdrop") or 
-                        "https://via.placeholder.com/1280x720/1a1a2e/eaeaea?text=No+Image",
+                    "released": episode.get("released") or yesterday,
+                    "thumbnail": episode.get("episode_backdrop") or "https://raw.githubusercontent.com/weebzone/Colab-Tools/refs/heads/main/no_episode_backdrop.png",
                     "imdb_id": episode.get("imdb_id") or media.get("imdb_id"),
                 })
 

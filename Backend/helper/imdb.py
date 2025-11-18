@@ -13,7 +13,10 @@ async def _get_client() -> httpx.AsyncClient:
     global _client
     async with _client_lock:
         if _client is None or _client.is_closed:
-            _client = httpx.AsyncClient(timeout=15.0)
+            _client = httpx.AsyncClient(
+                timeout=15.0,
+                follow_redirects=True
+            )
         return _client
 
 
@@ -54,13 +57,15 @@ async def search_title(query: str, type: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def get_detail(imdb_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetch meta details for given imdb_id from Cinemeta.
-    Tries /meta/movie/ID and /meta/series/ID (caller expects type inference).
-    """
+async def get_detail(imdb_id: str, media_type: str) -> Optional[Dict[str, Any]]:
     client = await _get_client()
-    for media_type in ['movie', 'series']:
+
+    if media_type == "tvSeries":
+        media_types = ["series"]
+    else:
+        media_types = ["movie"]
+
+    for media_type in media_types:
         try:
             url = f"{BASE_URL}/meta/{media_type}/{imdb_id}.json"
             resp = await client.get(url)
@@ -71,20 +76,21 @@ async def get_detail(imdb_id: str) -> Optional[Dict[str, Any]]:
                 continue
             meta = data['meta']
             year_value = 0
-            for year_field in ['year', 'releaseInfo', 'released']:
-                if meta.get(year_field):
-                    year_value = extract_first_year(meta[year_field])
-                    if year_value > 0:
+            for field in ['year', 'releaseInfo', 'released']:
+                if meta.get(field):
+                    year_value = extract_first_year(meta[field])
+                    if year_value:
                         break
+
             return {
-                'id': meta.get('imdb_id', meta.get('id', '')),
+                'id': meta.get('imdb_id', meta.get('id')),
                 'moviedb_id': meta.get('moviedb_id', None),
                 'type': meta.get('type', media_type),
                 'title': meta.get('name', ''),
                 'plot': meta.get('description', ''),
                 'genre': meta.get('genres', []) or meta.get('genre', []),
                 'releaseDetailed': {'year': year_value},
-                'rating': {'star': float(meta.get('imdbRating', '0')) if meta.get('imdbRating') else 0},
+                'rating': {'star': float(meta.get('imdbRating', 0))},
                 'poster': meta.get('poster', ''),
                 'background': meta.get('background', ''),
                 'logo': meta.get('logo', ''),
