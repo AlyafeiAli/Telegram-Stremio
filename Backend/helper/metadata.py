@@ -173,8 +173,23 @@ async def metadata(filename: str, channel: int, msg_id) -> dict | None:
     title = parsed.get("title")
     season = parsed.get("season")
     episode = parsed.get("episode")
-    year = parsed.get("year")
+    year = "" #parsed.get("year")
     quality = parsed.get("resolution")
+
+    if not season:
+        if not episode:
+            season = 1
+            episode = title.split()[-1]
+            title = title.rsplit(' ', 1)[0]
+            LOGGER.info(f"Assuming S01E{episode} for {filename}")
+        else:
+            season = 1
+            LOGGER.info(f"Assuming S01E{episode} for {filename}")
+        # return await fetch_tv_metadata(title, season, episode, encoded_string, year, quality, default_id) 
+
+
+
+    
     if isinstance(season, list) or isinstance(episode, list):
         LOGGER.warning(f"Invalid season/episode format for {filename}: {parsed}")
         return None
