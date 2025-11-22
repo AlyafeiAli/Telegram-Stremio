@@ -3,7 +3,7 @@ from time import time
 from datetime import datetime
 import pytz
 
-timezone = pytz.timezone("Asia/Kolkata")
+timezone = pytz.timezone("Asia/Dubai")
 now = datetime.now(timezone)
 StartTime = time()
 
