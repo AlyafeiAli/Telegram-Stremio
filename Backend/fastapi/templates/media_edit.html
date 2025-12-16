@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Edit {{ media_type|title }} - Telegram Stremio{% endblock %}
+{% block title %}Edit {{ media_type|title }} - Fyvio Backend{% endblock %}
 
 {% block content %}
 <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-8">
@@ -220,7 +220,7 @@
                     </div>
                     <p class="text-sm text-gray-500 mt-2 sm:mt-1 break-all">{{ quality.name }}</p>
                 </div>
-                <button onclick="deleteQuality('{{ quality.quality }}')" 
+                <button onclick="deleteQuality('{{ quality.id }}')" 
                         class="self-start sm:self-center text-red-600 hover:text-red-800 hover:bg-red-50 px-3 py-1 rounded transition-colors text-sm">
                     Delete
                 </button>
@@ -277,7 +277,7 @@
                                                 <span class="text-xs text-gray-500">{{ quality.size }}</span>
                                                 <span class="text-xs text-gray-400 break-all">{{ quality.name }}</span>
                                             </div>
-                                            <button onclick="deleteTVQuality({{ season.season_number }}, {{ episode.episode_number }}, '{{ quality.quality }}')" 
+                                            <button onclick="deleteTVQuality({{ season.season_number }}, {{ episode.episode_number }}, '{{ quality.id }}')" 
                                                     class="self-start sm:self-center text-red-600 hover:text-red-800 hover:bg-red-50 px-2 py-1 rounded transition-colors text-xs">
                                                 Delete
                                             </button>
@@ -383,47 +383,47 @@ async function updateMedia(event) {
     }
 }
 
-// Delete quality from movie
-async function deleteQuality(quality) {
-    if (!confirm(`Are you sure you want to delete the ${quality} quality?`)) return;
+// Delete name from movie
+async function deleteQuality(id) {
+    if (!confirm(`Are you sure you want to delete the ${id} ?`)) return;
     
     try {
-        const response = await fetch(`/api/media/delete-quality?tmdb_id=${tmdbId}&db_index=${dbIndex}&quality=${encodeURIComponent(quality)}`, {
+        const response = await fetch(`/api/media/delete-quality?tmdb_id=${tmdbId}&db_index=${dbIndex}&id=${encodeURIComponent(id)}`, {
             method: 'DELETE'
         });
         
         if (response.ok) {
-            showSuccessMessage(`${quality} quality deleted successfully`);
+            showSuccessMessage(`${id} deleted successfully`);
             setTimeout(() => location.reload(), 1000);
         } else {
             const error = await response.json();
-            showErrorMessage(`Error deleting quality: ${error.detail || 'Unknown error'}`);
+            showErrorMessage(`Error deleting : ${error.detail || 'Unknown error'}`);
         }
     } catch (error) {
-        console.error('Error deleting quality:', error);
-        showErrorMessage('Error deleting quality. Please try again.');
+        console.error('Error deleting :', error);
+        showErrorMessage('Error deleting . Please try again.');
     }
 }
 
 // Delete TV quality
-async function deleteTVQuality(season, episode, quality) {
-    if (!confirm(`Are you sure you want to delete the ${quality} quality from Season ${season} Episode ${episode}?`)) return;
+async function deleteTVQuality(season, episode, id) {
+    if (!confirm(`Are you sure you want to delete the ${id} from Season ${season} Episode ${episode}?`)) return;
     
     try {
-        const response = await fetch(`/api/media/delete-tv-quality?tmdb_id=${tmdbId}&db_index=${dbIndex}&season=${season}&episode=${episode}&quality=${encodeURIComponent(quality)}`, {
+        const response = await fetch(`/api/media/delete-tv-quality?tmdb_id=${tmdbId}&db_index=${dbIndex}&season=${season}&episode=${episode}&id=${encodeURIComponent(id)}`, {
             method: 'DELETE'
         });
         
         if (response.ok) {
-            showSuccessMessage(`${quality} quality deleted successfully`);
+            showSuccessMessage(`${id} deleted successfully`);
             setTimeout(() => location.reload(), 1000);
         } else {
             const error = await response.json();
-            showErrorMessage(`Error deleting quality: ${error.detail || 'Unknown error'}`);
+            showErrorMessage(`Error deleting : ${error.detail || 'Unknown error'}`);
         }
     } catch (error) {
-        console.error('Error deleting quality:', error);
-        showErrorMessage('Error deleting quality. Please try again.');
+        console.error('Error deleting :', error);
+        showErrorMessage('Error deleting. Please try again.');
     }
 }
 

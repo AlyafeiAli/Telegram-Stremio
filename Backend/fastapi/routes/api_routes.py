@@ -119,9 +119,9 @@ async def get_media_details_api(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-async def delete_movie_quality_api(tmdb_id: int, db_index: int, quality: str):
+async def delete_movie_quality_api(tmdb_id: int, db_index: int, id: str):
     try:
-        result = await db.delete_movie_quality(tmdb_id, db_index, quality)
+        result = await db.delete_movie_quality(tmdb_id, db_index, id)
         if result:
             return {"message": "Quality deleted successfully"}
         else:
@@ -130,12 +130,12 @@ async def delete_movie_quality_api(tmdb_id: int, db_index: int, quality: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 async def delete_tv_quality_api(
-    tmdb_id: int, db_index: int, season: int, episode: int, quality: str
+    tmdb_id: int, db_index: int, season: int, episode: int, id: str
 ):
     try:
-        result = await db.delete_tv_quality(tmdb_id, db_index, season, episode, quality)
+        result = await db.delete_tv_quality(tmdb_id, db_index, season, episode, id)
         if result:
-            return {"message": "Quality deleted successfully"}
+            return {"message": "deleted successfully"}
         else:
             raise HTTPException(status_code=404, detail="Quality not found")
     except Exception as e:

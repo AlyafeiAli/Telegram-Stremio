@@ -4,7 +4,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from Backend import __version__
-
 from Backend.fastapi.security.credentials import require_auth
 from Backend.fastapi.routes.stream_routes import router as stream_router
 from Backend.fastapi.routes.stremio_routes import router as stremio_router
@@ -37,7 +36,7 @@ app.add_middleware(
 try:
     app.mount("/static", StaticFiles(directory="Backend/fastapi/static"), name="static")
 except Exception:
-    pass 
+    pass
 
 # --- Include existing API routers ---
 app.include_router(stream_router)
@@ -83,9 +82,9 @@ async def edit_media(request: Request, tmdb_id: int, db_index: int, media_type: 
 
 @app.get("/api/media/list")
 async def list_media(
-    media_type: str = Query("movie", regex="^(movie|tv)$"), 
-    page: int = Query(1, ge=1), 
-    page_size: int = Query(24, ge=1, le=100), 
+    media_type: str = Query("movie", regex="^(movie|tv)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(24, ge=1, le=100),
     search: str = Query("", max_length=100),
     _: bool = Depends(require_auth)
 ):
@@ -100,12 +99,12 @@ async def update_media(request: Request, tmdb_id: int, db_index: int, media_type
     return await update_media_api(request, tmdb_id, db_index, media_type)
 
 @app.delete("/api/media/delete-quality")
-async def delete_movie_quality(tmdb_id: int, db_index: int, quality: str, _: bool = Depends(require_auth)):
-    return await delete_movie_quality_api(tmdb_id, db_index, quality)
+async def delete_movie_quality(tmdb_id: int, db_index: int, id: str, _: bool = Depends(require_auth)):
+    return await delete_movie_quality_api(tmdb_id, db_index, id)
 
 @app.delete("/api/media/delete-tv-quality")
-async def delete_tv_quality(tmdb_id: int, db_index: int, season: int, episode: int, quality: str, _: bool = Depends(require_auth)):
-    return await delete_tv_quality_api(tmdb_id, db_index, season, episode, quality)
+async def delete_tv_quality(tmdb_id: int, db_index: int, season: int, episode: int, id: str, _: bool = Depends(require_auth)):
+    return await delete_tv_quality_api(tmdb_id, db_index, season, episode, id)
 
 @app.delete("/api/media/delete-tv-episode")
 async def delete_tv_episode(tmdb_id: int, db_index: int, season: int, episode: int, _: bool = Depends(require_auth)):
@@ -114,7 +113,6 @@ async def delete_tv_episode(tmdb_id: int, db_index: int, season: int, episode: i
 @app.delete("/api/media/delete-tv-season")
 async def delete_tv_season(tmdb_id: int, db_index: int, season: int, _: bool = Depends(require_auth)):
     return await delete_tv_season_api(tmdb_id, db_index, season)
-
 
 @app.get("/api/system/workloads")
 async def get_workloads(_: bool = Depends(require_auth)):
@@ -130,7 +128,6 @@ async def get_workloads(_: bool = Depends(require_auth)):
         }
     except Exception as e:
         return {"loads": {}}
-
 
 @app.exception_handler(401)
 async def auth_exception_handler(request: Request, exc):

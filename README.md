@@ -217,6 +217,7 @@ All environment variables for this project are defined in the `config.env` file.
 | **`BOT_TOKEN`** | The main bot’s **access token** from [@BotFather](https://t.me/BotFather). Handles user requests and media fetching. |
 | **`HELPER_BOT_TOKEN`** | **Secondary bot token** used to assist the main bot with tasks like deleting, editing, or managing. |
 | **`OWNER_ID`** | Your **Telegram user ID**. This ID has full administrative access. |
+| **`REPLACE_MODE`** | When `true`, new files replace existing files of the same quality. When `false`, multiple files of the same quality are allowed. |
 
 ### 🗄️ Storage
 
