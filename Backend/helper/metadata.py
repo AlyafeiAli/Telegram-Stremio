@@ -9,6 +9,7 @@ from Backend.helper.kitsu import (
     get_anime as kitsu_get_anime,
     get_episode_by_number as kitsu_get_episode,
     get_categories as kitsu_get_categories,
+    get_animeapi_mappings,
 )
 from themoviedb import aioTMDb
 from Backend.config import Telegram
@@ -303,6 +304,70 @@ async def _kitsu_lookup(title: str) -> dict | None:
         return None
 
 
+async def _resolve_external_ids_for_anime(
+    kitsu_id: str | int,
+    clean_title: str,
+) -> tuple[str | None, int | None]:
+    """
+    Resolve (imdb_id, tmdb_id) for a Kitsu anime.
+
+    Order of attempts:
+      1. AnimeAPI (animeapi.my.id) — best coverage of IMDb/TMDb anime mappings.
+      2. IMDb text search using Kitsu's clean title.
+      3. TMDb text search; if a TMDb hit has external_ids, take its IMDb too.
+
+    Returns (None, None) if nothing matches. Stremio is keyed on IMDb IDs,
+    so the caller should refuse to ship an anime entry with imdb_id=None.
+    """
+    imdb_id: str | None = None
+    tmdb_id: int | None = None
+
+    # ---- 1. AnimeAPI ----
+    try:
+        async with API_SEMAPHORE:
+            mapping = await get_animeapi_mappings(kitsu_id)
+        if mapping:
+            imdb_id = mapping.get("imdb_id") or None
+            tmdb_id = mapping.get("tmdb_id") or None
+            if imdb_id or tmdb_id:
+                LOGGER.info(
+                    f"AnimeAPI mapping for kitsu={kitsu_id}: "
+                    f"imdb={imdb_id} tmdb={tmdb_id}"
+                )
+    except Exception as e:
+        LOGGER.warning(f"AnimeAPI lookup failed for kitsu={kitsu_id}: {e}")
+
+    # ---- 2. IMDb text search ----
+    if not imdb_id and clean_title:
+        try:
+            imdb_id = await safe_imdb_search(clean_title, "tvSeries")
+            if imdb_id:
+                LOGGER.info(f"IMDb text search resolved '{clean_title}' → {imdb_id}")
+        except Exception as e:
+            LOGGER.warning(f"IMDb text search failed for '{clean_title}': {e}")
+
+    # ---- 3. TMDb text search (also pull its imdb_id if we still don't have one) ----
+    if (not tmdb_id or not imdb_id) and clean_title:
+        try:
+            tmdb_search = await safe_tmdb_search(clean_title, "tv")
+            if tmdb_search:
+                if not tmdb_id:
+                    tmdb_id = tmdb_search.id
+                if not imdb_id:
+                    details = await _tmdb_tv_details(tmdb_search.id)
+                    ext = getattr(details, "external_ids", None) if details else None
+                    cand = getattr(ext, "imdb_id", None) if ext else None
+                    if cand and str(cand).startswith("tt"):
+                        imdb_id = cand
+                        LOGGER.info(
+                            f"TMDb→IMDb via external_ids: '{clean_title}' → {imdb_id}"
+                        )
+        except Exception as e:
+            LOGGER.warning(f"TMDb text search failed for '{clean_title}': {e}")
+
+    return imdb_id, tmdb_id
+
+
 async def fetch_anime_metadata_kitsu(
     title: str,
     absolute_episode: int,
@@ -311,30 +376,36 @@ async def fetch_anime_metadata_kitsu(
 ) -> dict | None:
     """
     Build full metadata for an anime episode using Kitsu as the primary source.
-    Returns a dict with only the fields required for the anime path, or None
-    if Kitsu can't find the anime (caller should then fall back to TMDb path).
+
+    Returns the same dict shape as fetch_tv_metadata so downstream code does
+    not need to branch on the source. Stremio's catalog/library/episode
+    binding is keyed on IMDb IDs, so if no IMDb ID can be resolved through
+    any of (AnimeAPI, IMDb search, TMDb search) this function returns None
+    and the caller falls back to the TMDb path.
     """
     anime = await _kitsu_lookup(title)
     if not anime:
         return None
 
     kitsu_id = anime["kitsu_id"]
+    clean_title = anime.get("title") or anime.get("canonical_title") or title
     LOGGER.info(
-        f"Kitsu matched '{title}' → {anime.get('title')} "
+        f"Kitsu matched '{title}' → {clean_title} "
         f"(kitsu_id={kitsu_id}, subtype={anime.get('subtype')})"
     )
 
-    # Run details, episode, and categories concurrently
+    # Fan out: details, episode, categories, and external-ID resolution.
     try:
-        details, episode, categories = await asyncio.gather(
+        details, episode, categories, external_ids = await asyncio.gather(
             kitsu_get_anime(kitsu_id),
             kitsu_get_episode(kitsu_id, absolute_episode),
             kitsu_get_categories(kitsu_id),
+            _resolve_external_ids_for_anime(kitsu_id, clean_title),
             return_exceptions=True,
         )
     except Exception as e:
         LOGGER.warning(f"Kitsu fan-out failed for kitsu_id={kitsu_id}: {e}")
-        details, episode, categories = anime, None, []
+        details, episode, categories, external_ids = anime, None, [], (None, None)
 
     if isinstance(details, Exception) or not details:
         details = anime
@@ -342,8 +413,26 @@ async def fetch_anime_metadata_kitsu(
         episode = None
     if isinstance(categories, Exception) or not categories:
         categories = []
+    if isinstance(external_ids, Exception) or not external_ids:
+        imdb_id, tmdb_id = None, None
+    else:
+        imdb_id, tmdb_id = external_ids
 
-    # Year from startDate (ISO format like "1993-10-16")
+    # No IMDb ID → Stremio can't bind this entry. Bail so we fall through
+    # to the TMDb path instead of returning an unusable record.
+    if not imdb_id:
+        LOGGER.warning(
+            f"No IMDb ID found for anime '{clean_title}' (kitsu={kitsu_id}); "
+            f"falling back to TMDb path so Stremio can index the entry"
+        )
+        return None
+
+    # Use IMDb's metahub for logo (Stremio's own convention) when we have an
+    # IMDb ID — it gives a much nicer logo than the empty string we'd
+    # otherwise have, and it matches how the IMDb branch behaves.
+    images = format_imdb_images(imdb_id)
+
+    # Year from Kitsu's startDate (ISO like "1993-10-16")
     year = 0
     start_date = details.get("start_date") or ""
     if start_date:
@@ -352,6 +441,14 @@ async def fetch_anime_metadata_kitsu(
         except (ValueError, IndexError):
             year = 0
 
+    # Rating: Kitsu averageRating is 0–100; normalise to 0–10 to match the
+    # TMDb scale used by the other branches.
+    raw_rating = details.get("rating") if details else None
+    try:
+        rate = round(float(raw_rating) / 10, 2) if raw_rating else 0
+    except (TypeError, ValueError):
+        rate = 0
+
     # Runtime: prefer per-episode length, then series-wide episode length
     runtime_val = (
         (episode.get("length") if episode else None)
@@ -359,24 +456,34 @@ async def fetch_anime_metadata_kitsu(
     )
     runtime = f"{runtime_val} min" if runtime_val else ""
 
+    # Episode released — format to match the TMDb path
+    episode_released = ""
+    if episode and episode.get("air_date"):
+        episode_released = f"{episode['air_date']}T05:00:00.000Z"
+
+    # tmdb_id fallback for downstream code that expects a numeric ID even
+    # when we couldn't resolve TMDb specifically (mirrors the IMDb-branch
+    # convention of using the IMDb ID stripped of "tt").
+    tmdb_id_out = tmdb_id if tmdb_id else imdb_id.replace("tt", "")
+
     return {
-        "kitsu_id": kitsu_id,
-        "imdb_id": "",
-        "tmdb_id": 000000,
-        "title": details.get("title") or anime.get("title") or title,
+        "tmdb_id": tmdb_id_out,
+        "imdb_id": imdb_id,
+        "title": details.get("title") or clean_title,
         "year": year,
+        "rate": rate,
         "description": details.get("synopsis", ""),
-        "poster": details.get("poster", ""),
-        "backdrop": details.get("backdrop", ""),
-        "logo": "",
-        "runtime": str(runtime),
+        "poster": details.get("poster") or images["poster"],
+        "backdrop": details.get("backdrop") or images["backdrop"],
+        "logo": images["logo"],
         "genres": categories,
         "media_type": "tv",
-		"rate":0,
-		"release_year":year,
-		"cast":[""],
+        "cast": [],   # Kitsu doesn't expose cast on the anime resource
+        "runtime": str(runtime),
 
-        # Kitsu uses absolute numbering natively → season 1, episode = absolute
+        # Kitsu uses absolute numbering natively → season 1, episode = absolute.
+        # This matches Stremio's standard tt-id:season:episode addressing scheme
+        # for anime addressed by absolute number.
         "season_number": 1,
         "episode_number": absolute_episode,
         "absolute_episode": absolute_episode,
@@ -384,9 +491,9 @@ async def fetch_anime_metadata_kitsu(
             (episode.get("title") if episode else None)
             or f"Episode {absolute_episode}"
         ),
-		"episode_backdrop": details.get("backdrop", ""),
-		"episode_overview": "",
-		"episode_released": "",
+        "episode_backdrop": (episode.get("thumbnail") if episode else "") or "",
+        "episode_overview": (episode.get("synopsis") if episode else "") or "",
+        "episode_released": episode_released,
 
         "quality": quality,
         "encoded_string": encoded_string,
@@ -494,7 +601,7 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
             if kitsu_meta:
                 return kitsu_meta
             LOGGER.info(
-                f"Kitsu had no match for '{title}', falling back to TMDb/IMDb"
+                f"Kitsu had no usable match for '{title}', falling back to TMDb/IMDb"
             )
 
         if season and episode:
