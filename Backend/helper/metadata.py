@@ -361,6 +361,8 @@ async def fetch_anime_metadata_kitsu(
 
     return {
         "kitsu_id": kitsu_id,
+        "imdb_id": "",
+        "tmdb_id": "",
         "title": details.get("title") or anime.get("title") or title,
         "year": year,
         "description": details.get("synopsis", ""),
