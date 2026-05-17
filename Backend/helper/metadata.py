@@ -23,11 +23,28 @@ EPISODE_CACHE: dict = {}
 # Concurrency semaphore for external API calls
 API_SEMAPHORE = asyncio.Semaphore(12)
 
+# ----------------- Patterns -----------------
+CRC32_PATTERN = compile(r'\s*[\(\[]\s*[0-9A-Fa-f]{8}\s*[\)\]]\s*', IGNORECASE)
+MULTIPART_PATTERN = compile(r'(?:part|cd|disc|disk)[s._-]*\d+(?=\.\w+$)', IGNORECASE)
+ANIME_ABSOLUTE_PATTERN = compile(
+    r'^(?P<title>.+?)[.\s_-]+'
+    r'(?P<absolute>\d{2,4})'
+    r'(?:[.\s_-]+(?P<res>\d{3,4}p))?'
+    r'(?:\.\w+)?$',
+    IGNORECASE
+)
+
 # ----------------- Helpers -----------------
+def strip_crc32(filename: str) -> str:
+    """Remove CRC32 checksums like [A1B2C3D4] or (a1b2c3d4) from filename."""
+    return CRC32_PATTERN.sub('', filename).strip()
+
+
 def format_tmdb_image(path: str, size="w500") -> str:
     if not path:
         return ""
     return f"https://image.tmdb.org/t/p/{size}{path}"
+
 
 def get_tmdb_logo(images) -> str:
     if not images:
@@ -45,7 +62,7 @@ def get_tmdb_logo(images) -> str:
         if file_path:
             return format_tmdb_image(file_path, "w300")
     return ""
-    
+
 
 def format_imdb_images(imdb_id: str) -> dict:
     if not imdb_id:
@@ -55,6 +72,7 @@ def format_imdb_images(imdb_id: str) -> dict:
         "backdrop": f"https://images.metahub.space/background/medium/{imdb_id}/img",
         "logo": f"https://images.metahub.space/logo/medium/{imdb_id}/img",
     }
+
 
 def extract_default_id(url: str) -> str | None:
     # IMDb
@@ -69,6 +87,36 @@ def extract_default_id(url: str) -> str | None:
 
     return None
 
+
+def is_anime_absolute(parsed: dict, filename: str) -> bool:
+    """
+    Returns True if this looks like an anime file using absolute episode numbering.
+    Conditions:
+      - No season present in parsed result
+      - Episode present and > 100 (strong signal)
+      OR filename matches the bare absolute pattern
+    """
+    season = parsed.get("season")
+    episode = parsed.get("episode")
+
+    # Already has a season → standard numbering
+    if season:
+        return False
+
+    # Episode > 100 with no season is a strong anime signal
+    if episode and not season and int(episode) > 100:
+        return True
+
+    # Fallback: match raw filename pattern (handles episodes <= 100 too)
+    basename = filename.rsplit("/", 1)[-1]
+    # Strip extension for matching
+    name_no_ext = basename.rsplit(".", 1)[0] if "." in basename else basename
+    if ANIME_ABSOLUTE_PATTERN.match(name_no_ext):
+        return True
+
+    return False
+
+
 async def safe_imdb_search(title: str, type_: str) -> str | None:
     key = f"imdb::{type_}::{title}"
     if key in IMDB_CACHE:
@@ -82,6 +130,7 @@ async def safe_imdb_search(title: str, type_: str) -> str | None:
     except Exception as e:
         LOGGER.warning(f"IMDb search failed for '{title}' [{type_}]: {e}")
         return None
+
 
 async def safe_tmdb_search(title: str, type_: str, year=None):
     key = f"tmdb_search::{type_}::{title}::{year}"
@@ -100,6 +149,7 @@ async def safe_tmdb_search(title: str, type_: str, year=None):
         LOGGER.error(f"TMDb search failed for '{title}' [{type_}]: {e}")
         TMDB_SEARCH_CACHE[key] = None
         return None
+
 
 async def _tmdb_movie_details(movie_id):
     if movie_id in TMDB_DETAILS_CACHE:
@@ -151,10 +201,52 @@ async def _tmdb_episode_details(tv_id, season, episode):
         EPISODE_CACHE[key] = None
         return None
 
+
+async def resolve_anime_absolute_episode(tmdb_id: int, absolute: int) -> tuple[int, int] | None:
+    """
+    Walk TMDb seasons sequentially (skipping specials/season 0), counting
+    episodes, until we locate which season+episode the absolute number falls in.
+    """
+    cache_key = f"anime_abs::{tmdb_id}::{absolute}"
+    if cache_key in EPISODE_CACHE:
+        return EPISODE_CACHE[cache_key]
+
+    try:
+        tv = await _tmdb_tv_details(tmdb_id)
+        if not tv:
+            return None
+
+        # Exclude specials (season 0)
+        seasons = [s for s in (tv.seasons or []) if getattr(s, "season_number", 0) > 0]
+        seasons.sort(key=lambda s: s.season_number)
+
+        counter = 0
+        for season_obj in seasons:
+            season_num = season_obj.season_number
+            ep_count = getattr(season_obj, "episode_count", 0)
+
+            if counter + ep_count >= absolute:
+                ep_num = absolute - counter
+                result = (season_num, ep_num)
+                EPISODE_CACHE[cache_key] = result
+                return result
+
+            counter += ep_count
+
+    except Exception as e:
+        LOGGER.warning(f"Anime absolute resolution failed for tmdb_id={tmdb_id}, abs={absolute}: {e}")
+
+    EPISODE_CACHE[cache_key] = None
+    return None
+
+
 # ----------------- Main Metadata -----------------
 async def metadata(filename: str, channel: int, msg_id, override_id: str = None) -> dict | None:
+    # Strip CRC32 checksums before any parsing
+    clean_filename = strip_crc32(filename)
+
     try:
-        parsed = PTN.parse(filename)
+        parsed = PTN.parse(clean_filename)
     except Exception as e:
         LOGGER.error(f"PTN parsing failed for {filename}: {e}\n{traceback.format_exc()}")
         return None
@@ -165,32 +257,16 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
         return None
 
     # Skip split/multipart files
-    # if Telegram.SKIP_MULTIPART:
-    multipart_pattern = compile(r'(?:part|cd|disc|disk)[s._-]*\d+(?=\.\w+$)', IGNORECASE)
-    if multipart_pattern.search(filename):
+    if MULTIPART_PATTERN.search(clean_filename):
         LOGGER.info(f"Skipping {filename}: seems to be a split/multipart file")
         return None
 
     title = parsed.get("title")
     season = parsed.get("season")
     episode = parsed.get("episode")
-    year = "" #parsed.get("year")
+    year = parsed.get("year")
     quality = parsed.get("resolution")
 
-    if not season:
-        if not episode:
-            season = 1
-            episode = title.split()[-1]
-            title = title.rsplit(' ', 1)[0]
-            LOGGER.info(f"Assuming S01E{episode} for {filename}")
-        else:
-            season = 1
-            LOGGER.info(f"Assuming S01E{episode} for {filename}")
-        # return await fetch_tv_metadata(title, season, episode, encoded_string, year, quality, default_id) 
-
-
-
-    
     if isinstance(season, list) or isinstance(episode, list):
         LOGGER.warning(f"Invalid season/episode format for {filename}: {parsed}")
         return None
@@ -204,23 +280,22 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
         LOGGER.info(f"No title parsed from: {filename} (parsed={parsed})")
         return None
 
-
     default_id = None
     if override_id:
         try:
             default_id = extract_default_id(override_id) or override_id
         except Exception:
             pass
-            
+
     if not default_id:
         try:
             default_id = extract_default_id(Backend.USE_DEFAULT_ID)
         except Exception:
             pass
-            
+
     if not default_id:
         try:
-            default_id = extract_default_id(filename)
+            default_id = extract_default_id(clean_filename)
         except Exception:
             pass
 
@@ -234,12 +309,17 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
         if season and episode:
             LOGGER.info(f"Fetching TV metadata: {title} S{season}E{episode}")
             return await fetch_tv_metadata(title, season, episode, encoded_string, year, quality, default_id)
+        elif not season and episode:
+            # No season — could be anime with absolute episode numbering
+            LOGGER.info(f"No season detected for {filename}, checking for anime absolute episode")
+            return await fetch_tv_metadata(title, season, episode, encoded_string, year, quality, default_id)
         else:
             LOGGER.info(f"Fetching Movie metadata: {title} ({year})")
             return await fetch_movie_metadata(title, encoded_string, year, quality, default_id)
     except Exception as e:
         LOGGER.error(f"Error while fetching metadata for {filename}: {e}\n{traceback.format_exc()}")
         return None
+
 
 # ----------------- TV Metadata -----------------
 async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, quality=None, default_id=None) -> dict | None:
@@ -269,11 +349,40 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
         use_tmdb = not bool(imdb_id)
 
     # -------------------------------------------------------
-    # 3. IMDb fetch (series + episode)
+    # 3. Anime absolute episode resolution
+    #    Triggered when: no season, episode present
+    # -------------------------------------------------------
+    absolute_episode = None
+    if not season and episode:
+        absolute_episode = int(episode)
+        LOGGER.info(f"Detected possible anime absolute episode: {title} #{absolute_episode}")
+
+        # Need a TMDb ID to resolve season mapping
+        if not tmdb_id:
+            tmdb_search = await safe_tmdb_search(title, "tv", year)
+            if not tmdb_search:
+                LOGGER.warning(f"No TMDb result for anime '{title}', cannot resolve absolute episode")
+                return None
+            tmdb_id = tmdb_search.id
+            use_tmdb = True
+
+        resolved = await resolve_anime_absolute_episode(tmdb_id, absolute_episode)
+        if resolved:
+            season, episode = resolved
+            LOGGER.info(f"Resolved abs#{absolute_episode} → S{season}E{episode} for '{title}'")
+        else:
+            # Fallback: put it in S1 so we still return something usable
+            season, episode = 1, absolute_episode
+            LOGGER.warning(
+                f"Could not resolve abs#{absolute_episode} for '{title}', "
+                f"falling back to S1E{absolute_episode}"
+            )
+
+    # -------------------------------------------------------
+    # 4. IMDb fetch (series + episode)
     # -------------------------------------------------------
     if imdb_id and not use_tmdb:
         try:
-            # ----- series details
             if imdb_id in IMDB_CACHE:
                 imdb_tv = IMDB_CACHE[imdb_id]
             else:
@@ -281,7 +390,6 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
                     imdb_tv = await get_detail(imdb_id=imdb_id, media_type="tvSeries")
                 IMDB_CACHE[imdb_id] = imdb_tv
 
-            # ----- episode details
             ep_key = f"{imdb_id}::{season}::{episode}"
             if ep_key in EPISODE_CACHE:
                 imdb_ep = EPISODE_CACHE[ep_key]
@@ -297,7 +405,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
             use_tmdb = True
 
     # -------------------------------------------------------
-    # 4. Decide if TMDb required
+    # 5. Decide if TMDb is required
     # -------------------------------------------------------
     must_use_tmdb = (
         use_tmdb or
@@ -306,12 +414,11 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
     )
 
     # =======================================================
-    #  5. TMDb MODE
+    #  6. TMDb MODE
     # =======================================================
     if must_use_tmdb:
         LOGGER.info(f"No valid IMDb TV data for '{title}' → using TMDb")
 
-        # Search TMDb by title
         if not tmdb_id:
             tmdb_search = await safe_tmdb_search(title, "tv", year)
             if not tmdb_search:
@@ -319,16 +426,13 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
                 return None
             tmdb_id = tmdb_search.id
 
-        # Fetch full TV show details
         tv = await _tmdb_tv_details(tmdb_id)
         if not tv:
             LOGGER.warning(f"TMDb TV details failed for id={tmdb_id}")
             return None
 
-        # Fetch episode
         ep = await _tmdb_episode_details(tmdb_id, season, episode)
 
-        # Cast list
         credits = getattr(tv, "credits", None) or {}
         cast_arr = getattr(credits, "cast", []) or []
         cast = [
@@ -336,7 +440,6 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
             for c in cast_arr
         ]
 
-        # Runtime (prefer episode → series → empty)
         ep_runtime = getattr(ep, "runtime", None) if ep else None
         series_runtime = (
             tv.episode_run_time[0] if getattr(tv, "episode_run_time", None) else None
@@ -361,6 +464,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
 
             "season_number": season,
             "episode_number": episode,
+            "absolute_episode": absolute_episode,
             "episode_title": getattr(ep, "name", f"S{season}E{episode}") if ep else f"S{season}E{episode}",
             "episode_backdrop": format_tmdb_image(getattr(ep, "still_path", None), "original") if ep else "",
             "episode_overview": getattr(ep, "overview", "") if ep else "",
@@ -375,7 +479,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
         }
 
     # =======================================================
-    #  6. IMDb MODE
+    #  7. IMDb MODE
     # =======================================================
     imdb = imdb_tv or {}
     ep = imdb_ep or {}
@@ -393,12 +497,13 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
         "backdrop": images["backdrop"],
         "logo": images["logo"],
         "cast": imdb.get("cast", []),
-        "runtime": str(imdb.get("runtime") or ""),          
+        "runtime": str(imdb.get("runtime") or ""),
         "genres": imdb.get("genre", []),
         "media_type": "tv",
 
         "season_number": season,
         "episode_number": episode,
+        "absolute_episode": absolute_episode,
         "episode_title": ep.get("title", f"S{season}E{episode}"),
         "episode_backdrop": ep.get("image", ""),
         "episode_overview": ep.get("plot", ""),
@@ -424,10 +529,10 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
 
         if default_id.startswith("tt"):
             imdb_id = default_id
-            use_tmdb = False                       
+            use_tmdb = False
         elif default_id.isdigit():
             tmdb_id = int(default_id)
-            use_tmdb = True                       
+            use_tmdb = True
 
     # -------------------------------------------------------
     # 2. IF NO DEFAULT ID → SEARCH IMDb FIRST
@@ -475,7 +580,6 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
     if must_use_tmdb:
         LOGGER.info(f"No valid IMDb data for '{title}' → using TMDb")
 
-        # TMDb search if id unknown
         if not tmdb_id:
             tmdb_result = await safe_tmdb_search(title, "movie", year)
             if not tmdb_result:
@@ -483,13 +587,11 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
                 return None
             tmdb_id = tmdb_result.id
 
-        # Fetch TMDb details
         movie = await _tmdb_movie_details(tmdb_id)
         if not movie:
             LOGGER.warning(f"TMDb details failed for {tmdb_id}")
             return None
 
-        # Cast extraction
         credits = getattr(movie, "credits", None) or {}
         cast_arr = getattr(credits, "cast", []) or []
         cast_names = [
