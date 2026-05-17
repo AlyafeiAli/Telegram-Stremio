@@ -372,6 +372,9 @@ async def fetch_anime_metadata_kitsu(
         "runtime": str(runtime),
         "genres": categories,
         "media_type": "tv",
+		"rating":0,
+		"release_year":year,
+		"cast":[""],
 
         # Kitsu uses absolute numbering natively → season 1, episode = absolute
         "season_number": 1,
