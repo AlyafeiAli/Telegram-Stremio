@@ -384,6 +384,9 @@ async def fetch_anime_metadata_kitsu(
             (episode.get("title") if episode else None)
             or f"Episode {absolute_episode}"
         ),
+		"episode_backdrop": details.get("backdrop", ""),
+		"episode_overview": "",
+		"episode_released": "",
 
         "quality": quality,
         "encoded_string": encoded_string,
