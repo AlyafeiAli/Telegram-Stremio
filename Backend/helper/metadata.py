@@ -4,6 +4,12 @@ import PTN
 import re
 from re import compile, IGNORECASE
 from Backend.helper.imdb import get_detail, get_season, search_title
+from Backend.helper.kitsu import (
+    search_anime as kitsu_search_anime,
+    get_anime as kitsu_get_anime,
+    get_episode_by_number as kitsu_get_episode,
+    get_mappings as kitsu_get_mappings,
+)
 from themoviedb import aioTMDb
 from Backend.config import Telegram
 import Backend
@@ -19,6 +25,7 @@ IMDB_CACHE: dict = {}
 TMDB_SEARCH_CACHE: dict = {}
 TMDB_DETAILS_CACHE: dict = {}
 EPISODE_CACHE: dict = {}
+KITSU_CACHE: dict = {}
 
 # Concurrency semaphore for external API calls
 API_SEMAPHORE = asyncio.Semaphore(12)
@@ -33,6 +40,13 @@ BRACKET_GROUP_PATTERN = compile(r'^\[[^\]]+\]\s*')  # leading fansub group tag e
 ANIME_EP_BRACKET_PATTERN = compile(
     r'\[\s*(\d{1,4})\s*\](?!\s*p)',
     IGNORECASE
+)
+
+# Common signals that a release is an anime fansub
+ANIME_HINT_PATTERN = compile(
+    r'\b(?:hi10p?|ma10p|x265|hevc|10bit|dual[\s._-]?audio|sub(?:bed)?|dub(?:bed)?|'
+    r'bdrip|webrip|web-dl|aac|flac|opus)\b',
+    IGNORECASE,
 )
 
 # ----------------- Helpers -----------------
@@ -90,6 +104,20 @@ def clean_anime_title(title: str) -> str:
         return title
     cleaned = re.sub(r'\s*\[\s*\d{1,4}\s*\]\s*', ' ', title)
     return cleaned.strip()
+
+
+def looks_like_anime(filename: str, season, used_bracket_fallback: bool) -> bool:
+    """
+    Heuristic: is this release likely an anime?
+      - Anime [NN] bracket fallback fired (strongest signal)
+      - OR no season detected AND filename has anime-encoder hints
+        (Hi10p, Ma10p, x265, dual audio, sub/dub, fansub-style bracketing)
+    """
+    if used_bracket_fallback:
+        return True
+    if season:
+        return False
+    return bool(ANIME_HINT_PATTERN.search(filename))
 
 
 def format_tmdb_image(path: str, size="w500") -> str:
@@ -257,6 +285,144 @@ async def resolve_anime_absolute_episode(tmdb_id: int, absolute: int) -> tuple[i
     return None
 
 
+# ----------------- Kitsu -----------------
+async def _kitsu_lookup(title: str) -> dict | None:
+    """Search Kitsu and return the first hit (cached). None if no match."""
+    key = f"kitsu_search::{title.lower().strip()}"
+    if key in KITSU_CACHE:
+        return KITSU_CACHE[key]
+    try:
+        async with API_SEMAPHORE:
+            results = await kitsu_search_anime(title, limit=3)
+        result = results[0] if results else None
+        KITSU_CACHE[key] = result
+        return result
+    except Exception as e:
+        LOGGER.warning(f"Kitsu search failed for '{title}': {e}")
+        KITSU_CACHE[key] = None
+        return None
+
+
+async def fetch_anime_metadata_kitsu(
+    title: str,
+    absolute_episode: int,
+    encoded_string,
+    quality=None,
+) -> dict | None:
+    """
+    Build full metadata for an anime episode using Kitsu as the primary source.
+    Falls back to mappings to populate tmdb_id / imdb_id when possible.
+    Returns the same dict shape as fetch_tv_metadata, or None if Kitsu can't
+    find the anime (caller should then fall back to TMDb path).
+    """
+    anime = await _kitsu_lookup(title)
+    if not anime:
+        return None
+
+    kitsu_id = anime["kitsu_id"]
+    LOGGER.info(
+        f"Kitsu matched '{title}' → {anime.get('title')} "
+        f"(kitsu_id={kitsu_id}, subtype={anime.get('subtype')})"
+    )
+
+    # Run details, episode, and mappings concurrently
+    try:
+        details, episode, mappings = await asyncio.gather(
+            kitsu_get_anime(kitsu_id),
+            kitsu_get_episode(kitsu_id, absolute_episode),
+            kitsu_get_mappings(kitsu_id),
+            return_exceptions=True,
+        )
+    except Exception as e:
+        LOGGER.warning(f"Kitsu fan-out failed for kitsu_id={kitsu_id}: {e}")
+        details, episode, mappings = anime, None, {}
+
+    if isinstance(details, Exception) or not details:
+        details = anime
+    if isinstance(episode, Exception):
+        episode = None
+    if isinstance(mappings, Exception):
+        mappings = {}
+
+    # Extract external IDs from Kitsu mappings (best-effort)
+    tmdb_id = None
+    imdb_id = None
+    if mappings:
+        # Kitsu mapping keys observed: 'themoviedb/show', 'thetvdb/series',
+        # 'imdb', 'myanimelist/anime', 'anilist/anime', 'aniDB', etc.
+        for key, val in mappings.items():
+            lk = key.lower()
+            if "themoviedb" in lk and not tmdb_id:
+                try:
+                    tmdb_id = int(val)
+                except (TypeError, ValueError):
+                    pass
+            elif lk == "imdb" or lk.startswith("imdb"):
+                if str(val).startswith("tt"):
+                    imdb_id = str(val)
+
+    # Year from startDate (ISO format like "1993-10-16")
+    year = 0
+    start_date = details.get("start_date") or ""
+    if start_date:
+        try:
+            year = int(start_date.split("-")[0])
+        except (ValueError, IndexError):
+            year = 0
+
+    # Runtime
+    runtime_val = (
+        (episode.get("length") if episode else None)
+        or details.get("episode_length")
+    )
+    runtime = f"{runtime_val} min" if runtime_val else ""
+
+    # Episode-released formatted to match existing TMDb path style
+    episode_released = ""
+    if episode and episode.get("air_date"):
+        episode_released = f"{episode['air_date']}T05:00:00.000Z"
+
+    rating = details.get("rating")
+    try:
+        # Kitsu averageRating is 0–100; normalise to 0–10 to match TMDb scale
+        rate = round(float(rating) / 10, 2) if rating else 0
+    except (TypeError, ValueError):
+        rate = 0
+
+    return {
+        "tmdb_id": tmdb_id,
+        "imdb_id": imdb_id,
+        "kitsu_id": kitsu_id,
+        "title": details.get("title") or anime.get("title") or title,
+        "year": year,
+        "rate": rate,
+        "description": details.get("synopsis", ""),
+        "poster": details.get("poster", ""),
+        "backdrop": details.get("backdrop", ""),
+        "logo": "",
+        "genres": [],   # Kitsu categories require an extra call; omit by default
+        "media_type": "tv",
+        "cast": [],
+        "runtime": str(runtime),
+
+        # Kitsu uses absolute numbering natively → season 1, episode = absolute
+        "season_number": 1,
+        "episode_number": absolute_episode,
+        "absolute_episode": absolute_episode,
+        "episode_title": (
+            (episode.get("title") if episode else None)
+            or f"Episode {absolute_episode}"
+        ),
+        "episode_backdrop": (episode.get("thumbnail") if episode else "") or "",
+        "episode_overview": (episode.get("synopsis") if episode else "") or "",
+        "episode_released": episode_released,
+
+        "quality": quality,
+        "encoded_string": encoded_string,
+        "source": "kitsu",
+    }
+
+
 # ----------------- Main Metadata -----------------
 async def metadata(filename: str, channel: int, msg_id, override_id: str = None) -> dict | None:
     clean_filename = pre_clean_anime_filename(filename)
@@ -288,10 +454,12 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
     # when there's no season indicator (S01, 1x03, etc.). For anime releases
     # we need to detect these manually so we route to TV metadata instead
     # of falling through to the movie branch.
+    used_bracket_fallback = False
     if not episode and not season:
         fallback_ep = extract_anime_episode(clean_filename)
         if fallback_ep:
             episode = fallback_ep
+            used_bracket_fallback = True
             # Clean any episode bracket that PTN may have glued into the title
             title = clean_anime_title(title)
             LOGGER.info(f"Anime [NN] fallback: '{title}' episode #{episode}")
@@ -334,7 +502,31 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
     except Exception:
         encoded_string = None
 
+    # Decide whether to try Kitsu first.
+    # We only try Kitsu when there's no manual override and it really looks
+    # like anime — i.e. bracket fallback fired, or no-season + anime hints.
+    is_anime = (
+        not default_id
+        and episode
+        and looks_like_anime(filename, season, used_bracket_fallback)
+    )
+
     try:
+        if is_anime:
+            absolute = int(episode)
+            LOGGER.info(f"Trying Kitsu for anime '{title}' abs#{absolute}")
+            kitsu_meta = await fetch_anime_metadata_kitsu(
+                title=title,
+                absolute_episode=absolute,
+                encoded_string=encoded_string,
+                quality=quality,
+            )
+            if kitsu_meta:
+                return kitsu_meta
+            LOGGER.info(
+                f"Kitsu had no match for '{title}', falling back to TMDb/IMDb"
+            )
+
         if season and episode:
             LOGGER.info(f"Fetching TV metadata: {title} S{season}E{episode}")
             return await fetch_tv_metadata(title, season, episode, encoded_string, year, quality, default_id)
