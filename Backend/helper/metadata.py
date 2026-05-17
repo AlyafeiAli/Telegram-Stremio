@@ -372,7 +372,7 @@ async def fetch_anime_metadata_kitsu(
         "runtime": str(runtime),
         "genres": categories,
         "media_type": "tv",
-		"rating":0,
+		"rate":0,
 		"release_year":year,
 		"cast":[""],
 
