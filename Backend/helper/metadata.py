@@ -28,6 +28,13 @@ CRC32_PATTERN = compile(r'\s*[\(\[]\s*[0-9A-Fa-f]{8}\s*[\)\]]\s*', IGNORECASE)
 MULTIPART_PATTERN = compile(r'(?:part|cd|disc|disk)[s._-]*\d+(?=\.\w+$)', IGNORECASE)
 BRACKET_GROUP_PATTERN = compile(r'^\[[^\]]+\]\s*')  # leading fansub group tag e.g. [Kaiyou]
 
+# Matches a standalone bracketed 1-4 digit number that isn't a resolution.
+# e.g. [03], [12], [001], but not [1080p] (already has 'p' after digits)
+ANIME_EP_BRACKET_PATTERN = compile(
+    r'\[\s*(\d{1,4})\s*\](?!\s*p)',
+    IGNORECASE
+)
+
 # ----------------- Helpers -----------------
 def strip_crc32(filename: str) -> str:
     """Remove CRC32 checksums like [A1B2C3D4] or (a1b2c3d4) from filename."""
@@ -55,6 +62,34 @@ def extract_fallback_resolution(filename: str) -> str | None:
     """
     match = re.search(r'(\d{3,4}p)', filename, IGNORECASE)
     return match.group(1) if match else None
+
+
+def extract_anime_episode(filename: str) -> int | None:
+    """
+    Extract anime episode from [NN] style brackets when PTN misses it.
+    Skips bracketed numbers that look like years (1900-2099).
+    Returns the first plausible episode number found.
+    """
+    for match in ANIME_EP_BRACKET_PATTERN.finditer(filename):
+        num = int(match.group(1))
+        # Skip likely years
+        if 1900 <= num <= 2099:
+            continue
+        # Reasonable episode range
+        if 1 <= num <= 1999:
+            return num
+    return None
+
+
+def clean_anime_title(title: str) -> str:
+    """
+    Strip leftover episode brackets that PTN may have glued into the title
+    when it didn't recognize [NN] as an episode marker.
+    """
+    if not title:
+        return title
+    cleaned = re.sub(r'\s*\[\s*\d{1,4}\s*\]\s*', ' ', title)
+    return cleaned.strip()
 
 
 def format_tmdb_image(path: str, size="w500") -> str:
@@ -247,6 +282,19 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
     episode = parsed.get("episode")
     year = parsed.get("year")
     quality = parsed.get("resolution") or extract_fallback_resolution(filename)
+
+    # ----------------- Anime [NN] episode fallback -----------------
+    # PTN doesn't recognize bare bracketed numbers like [03] as episodes
+    # when there's no season indicator (S01, 1x03, etc.). For anime releases
+    # we need to detect these manually so we route to TV metadata instead
+    # of falling through to the movie branch.
+    if not episode and not season:
+        fallback_ep = extract_anime_episode(clean_filename)
+        if fallback_ep:
+            episode = fallback_ep
+            # Clean any episode bracket that PTN may have glued into the title
+            title = clean_anime_title(title)
+            LOGGER.info(f"Anime [NN] fallback: '{title}' episode #{episode}")
 
     if isinstance(season, list) or isinstance(episode, list):
         LOGGER.warning(f"Invalid season/episode format for {filename}: {parsed}")
