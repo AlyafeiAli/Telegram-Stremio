@@ -8,7 +8,7 @@ from Backend.helper.kitsu import (
     search_anime as kitsu_search_anime,
     get_anime as kitsu_get_anime,
     get_episode_by_number as kitsu_get_episode,
-    get_mappings as kitsu_get_mappings,
+    get_categories as kitsu_get_categories,
 )
 from themoviedb import aioTMDb
 from Backend.config import Telegram
@@ -311,9 +311,8 @@ async def fetch_anime_metadata_kitsu(
 ) -> dict | None:
     """
     Build full metadata for an anime episode using Kitsu as the primary source.
-    Falls back to mappings to populate tmdb_id / imdb_id when possible.
-    Returns the same dict shape as fetch_tv_metadata, or None if Kitsu can't
-    find the anime (caller should then fall back to TMDb path).
+    Returns a dict with only the fields required for the anime path, or None
+    if Kitsu can't find the anime (caller should then fall back to TMDb path).
     """
     anime = await _kitsu_lookup(title)
     if not anime:
@@ -325,41 +324,24 @@ async def fetch_anime_metadata_kitsu(
         f"(kitsu_id={kitsu_id}, subtype={anime.get('subtype')})"
     )
 
-    # Run details, episode, and mappings concurrently
+    # Run details, episode, and categories concurrently
     try:
-        details, episode, mappings = await asyncio.gather(
+        details, episode, categories = await asyncio.gather(
             kitsu_get_anime(kitsu_id),
             kitsu_get_episode(kitsu_id, absolute_episode),
-            kitsu_get_mappings(kitsu_id),
+            kitsu_get_categories(kitsu_id),
             return_exceptions=True,
         )
     except Exception as e:
         LOGGER.warning(f"Kitsu fan-out failed for kitsu_id={kitsu_id}: {e}")
-        details, episode, mappings = anime, None, {}
+        details, episode, categories = anime, None, []
 
     if isinstance(details, Exception) or not details:
         details = anime
     if isinstance(episode, Exception):
         episode = None
-    if isinstance(mappings, Exception):
-        mappings = {}
-
-    # Extract external IDs from Kitsu mappings (best-effort)
-    tmdb_id = None
-    imdb_id = None
-    if mappings:
-        # Kitsu mapping keys observed: 'themoviedb/show', 'thetvdb/series',
-        # 'imdb', 'myanimelist/anime', 'anilist/anime', 'aniDB', etc.
-        for key, val in mappings.items():
-            lk = key.lower()
-            if "themoviedb" in lk and not tmdb_id:
-                try:
-                    tmdb_id = int(val)
-                except (TypeError, ValueError):
-                    pass
-            elif lk == "imdb" or lk.startswith("imdb"):
-                if str(val).startswith("tt"):
-                    imdb_id = str(val)
+    if isinstance(categories, Exception) or not categories:
+        categories = []
 
     # Year from startDate (ISO format like "1993-10-16")
     year = 0
@@ -370,40 +352,24 @@ async def fetch_anime_metadata_kitsu(
         except (ValueError, IndexError):
             year = 0
 
-    # Runtime
+    # Runtime: prefer per-episode length, then series-wide episode length
     runtime_val = (
         (episode.get("length") if episode else None)
         or details.get("episode_length")
     )
     runtime = f"{runtime_val} min" if runtime_val else ""
 
-    # Episode-released formatted to match existing TMDb path style
-    episode_released = ""
-    if episode and episode.get("air_date"):
-        episode_released = f"{episode['air_date']}T05:00:00.000Z"
-
-    rating = details.get("rating")
-    try:
-        # Kitsu averageRating is 0–100; normalise to 0–10 to match TMDb scale
-        rate = round(float(rating) / 10, 2) if rating else 0
-    except (TypeError, ValueError):
-        rate = 0
-
     return {
-        "tmdb_id": tmdb_id,
-        "imdb_id": imdb_id,
         "kitsu_id": kitsu_id,
         "title": details.get("title") or anime.get("title") or title,
         "year": year,
-        "rate": rate,
         "description": details.get("synopsis", ""),
         "poster": details.get("poster", ""),
         "backdrop": details.get("backdrop", ""),
         "logo": "",
-        "genres": [],   # Kitsu categories require an extra call; omit by default
-        "media_type": "tv",
-        "cast": [],
         "runtime": str(runtime),
+        "genres": categories,
+        "media_type": "tv",
 
         # Kitsu uses absolute numbering natively → season 1, episode = absolute
         "season_number": 1,
@@ -413,13 +379,9 @@ async def fetch_anime_metadata_kitsu(
             (episode.get("title") if episode else None)
             or f"Episode {absolute_episode}"
         ),
-        "episode_backdrop": (episode.get("thumbnail") if episode else "") or "",
-        "episode_overview": (episode.get("synopsis") if episode else "") or "",
-        "episode_released": episode_released,
 
         "quality": quality,
         "encoded_string": encoded_string,
-        "source": "kitsu",
     }
 
 
