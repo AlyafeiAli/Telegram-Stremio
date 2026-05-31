@@ -498,6 +498,26 @@ async def fetch_anime_metadata_kitsu(
     # convention of using the IMDb ID stripped of "tt").
     tmdb_id_out = tmdb_id if tmdb_id else imdb_id.replace("tt", "")
 
+    season_number = 1
+    episode_number = absolute_episode
+    if tmdb_id:
+        try:
+            resolved = await resolve_anime_absolute_episode(int(tmdb_id), absolute_episode)
+            if resolved:
+                season_number, episode_number = resolved
+                LOGGER.info(
+                    f"Mapped abs#{absolute_episode} → S{season_number}E{episode_number} "
+                    f"via TMDb {tmdb_id} for '{clean_title}'"
+                )
+            else:
+                LOGGER.warning(
+                    f"Could not map abs#{absolute_episode} on TMDb {tmdb_id} "
+                    f"for '{clean_title}'; using S1E{absolute_episode}"
+                )
+        except Exception as e:
+            LOGGER.warning(f"Absolute→season mapping failed for tmdb={tmdb_id}: {e}")
+            
+
     return {
         "tmdb_id": tmdb_id_out,
         "imdb_id": imdb_id,
@@ -516,8 +536,8 @@ async def fetch_anime_metadata_kitsu(
         # Kitsu uses absolute numbering natively → season 1, episode = absolute.
         # This matches Stremio's standard tt-id:season:episode addressing scheme
         # for anime addressed by absolute number.
-        "season_number": 1,
-        "episode_number": absolute_episode,
+        "season_number": season_number,
+        "episode_number": episode_number,
         "absolute_episode": absolute_episode,
         "episode_title": (
             (episode.get("title") if episode else None)
