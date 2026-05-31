@@ -79,6 +79,22 @@ def extract_fallback_resolution(filename: str) -> str | None:
     return match.group(1) if match else None
 
 
+def extract_anime_episode(filename: str) -> int | None:
+    """
+    Extract anime episode from [NN] style brackets when PTN misses it.
+    Skips bracketed numbers that look like years (1900-2099).
+    Returns the first plausible episode number found.
+    """
+    for match in ANIME_EP_BRACKET_PATTERN.finditer(filename):
+        num = int(match.group(1))
+        # Skip likely years
+        if 1900 <= num <= 2099:
+            continue
+        # Reasonable episode range
+        if 1 <= num <= 1999:
+            return num
+    return None
+
 # Matches a trailing bare episode number PTN folds into the title,
 # e.g. "Slam Dunk 061", "Naruto - 134", "One Piece Ep 1000", "Bleach E12".
 
