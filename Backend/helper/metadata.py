@@ -79,21 +79,37 @@ def extract_fallback_resolution(filename: str) -> str | None:
     return match.group(1) if match else None
 
 
-def extract_anime_episode(filename: str) -> int | None:
+# Matches a trailing bare episode number PTN folds into the title,
+# e.g. "Slam Dunk 061", "Naruto - 134", "One Piece Ep 1000", "Bleach E12".
+
+BARE_ANIME_EP_PATTERN = compile(
+    r'^(.*?)[\s._-]+(?:ep|episode|e)?[\s._-]*(\d{1,4})$',
+    IGNORECASE,
+)
+
+
+def extract_bare_anime_episode(title: str) -> tuple[str, int] | None:
     """
-    Extract anime episode from [NN] style brackets when PTN misses it.
-    Skips bracketed numbers that look like years (1900-2099).
-    Returns the first plausible episode number found.
+    Detect a trailing bare episode number PTN glued onto the title when there
+    was no S01/1x03 marker, e.g. "Slam Dunk 061" -> ("Slam Dunk", 61).
+
+    Returns (clean_title, episode) or None. Skips likely years and refuses to
+    consume the entire title (so a title that is just a number is rejected).
     """
-    for match in ANIME_EP_BRACKET_PATTERN.finditer(filename):
-        num = int(match.group(1))
-        # Skip likely years
-        if 1900 <= num <= 2099:
-            continue
-        # Reasonable episode range
-        if 1 <= num <= 1999:
-            return num
-    return None
+    if not title:
+        return None
+    m = BARE_ANIME_EP_PATTERN.match(title.strip())
+    if not m:
+        return None
+    base = m.group(1).strip(" -_.")
+    if not base:
+        return None
+    num = int(m.group(2))
+    if 1900 <= num <= 2099:        # looks like a year, not an episode
+        return None
+    if not (1 <= num <= 1999):
+        return None
+    return base, num
 
 
 def clean_anime_title(title: str) -> str:
@@ -533,13 +549,21 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
     # of falling through to the movie branch.
     used_bracket_fallback = False
     if not episode and not season:
+        # 1) [NN] bracket-style episodes, e.g. [Group] Show [03]
         fallback_ep = extract_anime_episode(clean_filename)
         if fallback_ep:
             episode = fallback_ep
             used_bracket_fallback = True
-            # Clean any episode bracket that PTN may have glued into the title
             title = clean_anime_title(title)
             LOGGER.info(f"Anime [NN] fallback: '{title}' episode #{episode}")
+        # 2) bare trailing episode number, e.g. "Slam Dunk 061"
+        #    Gated on anime hints so we don't mangle real movies like "Apollo 13".
+        elif ANIME_HINT_PATTERN.search(filename):
+            bare = extract_bare_anime_episode(title)
+            if bare:
+                title, episode = bare
+                used_bracket_fallback = True
+                LOGGER.info(f"Anime bare-number fallback: '{title}' episode #{episode}")
 
     if isinstance(season, list) or isinstance(episode, list):
         LOGGER.warning(f"Invalid season/episode format for {filename}: {parsed}")
