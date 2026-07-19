@@ -6,6 +6,100 @@ from Backend import db, __version__
 import PTN
 from datetime import datetime, timezone, timedelta
 from Backend.fastapi.security.tokens import verify_token
+from Backend.helper.kitsu import get_animeapi_mappings
+
+
+# --- Kitsu ID support ---------------------------------------------------
+# The Anime Kitsu catalog addon addresses content as:
+#     series  : kitsu:{kitsu_id}
+#     episode : kitsu:{kitsu_id}:{absolute_episode}
+# Our documents are primarily keyed on IMDb IDs, but since Kitsu support was
+# added we also store `kitsu_id` on the document and `absolute_episode` on each
+# episode. We therefore resolve in that order, falling back to the AnimeAPI
+# cross-mapping service for documents ingested before Kitsu support existed.
+
+_KITSU_MAPPING_CACHE: dict = {}
+
+
+def parse_kitsu_id(raw_id: str) -> tuple[Optional[str], Optional[int]]:
+    """
+    Split 'kitsu:12345' or 'kitsu:12345:7' into (kitsu_id, absolute_episode).
+    Returns (None, None) if the id isn't a well-formed kitsu identifier.
+    """
+    if not raw_id or not raw_id.startswith("kitsu:"):
+        return None, None
+
+    parts = raw_id.split(":")
+    # parts[0] == 'kitsu'
+    if len(parts) < 2 or not parts[1].strip():
+        return None, None
+
+    kitsu_id = parts[1].strip()
+    absolute_episode = None
+    if len(parts) > 2 and parts[2].strip().isdigit():
+        absolute_episode = int(parts[2].strip())
+
+    return kitsu_id, absolute_episode
+
+
+async def kitsu_to_imdb(kitsu_id: str) -> Optional[str]:
+    """
+    Map a Kitsu ID to an IMDb ID via AnimeAPI, cached per process.
+    Used only as a fallback for documents that predate kitsu_id storage.
+    """
+    if not kitsu_id:
+        return None
+    if kitsu_id in _KITSU_MAPPING_CACHE:
+        return _KITSU_MAPPING_CACHE[kitsu_id]
+    try:
+        mapping = await get_animeapi_mappings(kitsu_id)
+        imdb_id = (mapping or {}).get("imdb_id")
+    except Exception:
+        imdb_id = None
+    _KITSU_MAPPING_CACHE[kitsu_id] = imdb_id
+    return imdb_id
+
+
+async def resolve_media_request(raw_id: str) -> dict:
+    """
+    Normalise any Stremio id (tt... or kitsu:...) into lookup kwargs for
+    db.get_media_details(). Returns {} when the id can't be resolved.
+    """
+    if raw_id.startswith("kitsu:"):
+        kitsu_id, absolute_episode = parse_kitsu_id(raw_id)
+        if not kitsu_id:
+            return {}
+
+        lookup = {"kitsu_id": kitsu_id}
+        if absolute_episode is not None:
+            lookup["absolute_episode"] = absolute_episode
+
+        # Probe: does any document actually carry this kitsu_id?
+        probe = await db.get_media_details(kitsu_id=kitsu_id)
+        if probe:
+            return lookup
+
+        # Legacy fallback — map to IMDb and look the entry up that way.
+        imdb_id = await kitsu_to_imdb(kitsu_id)
+        if not imdb_id:
+            return {}
+
+        lookup = {"imdb_id": imdb_id}
+        if absolute_episode is not None:
+            lookup["absolute_episode"] = absolute_episode
+        return lookup
+
+    # Standard IMDb addressing: tt1234567[:season:episode]
+    parts = raw_id.split(":")
+    imdb_id = parts[0]
+    if not imdb_id:
+        return {}
+
+    lookup = {"imdb_id": imdb_id}
+    if len(parts) > 2 and parts[1].isdigit() and parts[2].isdigit():
+        lookup["season_number"] = int(parts[1])
+        lookup["episode_number"] = int(parts[2])
+    return lookup
 
 
 # --- Configuration ---
@@ -202,7 +296,7 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
         "types": ["movie", "series"],
         "resources": resources,
         "catalogs": catalogs,
-        "idPrefixes": ["tt"],
+        "idPrefixes": ["tt", "kitsu"],
         "behaviorHints": {
             "configurable": True,
             "configurationRequired": False
@@ -436,17 +530,28 @@ async def get_catalog(token: str, media_type: str, id: str, extra: Optional[str]
 async def get_meta(token: str, media_type: str, id: str, token_data: dict = Depends(verify_token)):
     if Telegram.HIDE_CATALOG:
         raise HTTPException(status_code=404, detail="Catalog disabled")
-    try:
-        imdb_id = id
-    except (ValueError, IndexError):
-        raise HTTPException(status_code=400, detail="Invalid Stremio ID format")
+    # Resolve series-level lookup only (strip any episode component), so that
+    # both tt-style and kitsu-style ids land on the same document.
+    series_id = id
+    is_kitsu = id.startswith("kitsu:")
+    if is_kitsu:
+        kitsu_id, _ = parse_kitsu_id(id)
+        if not kitsu_id:
+            return {"meta": {}}
+        series_id = f"kitsu:{kitsu_id}"
+    else:
+        series_id = id.split(":")[0]
 
-    media = await db.get_media_details(imdb_id=imdb_id)
+    lookup = await resolve_media_request(series_id)
+    if not lookup:
+        return {"meta": {}}
+
+    media = await db.get_media_details(**lookup)
     if not media:
         return {"meta": {}}
 
     meta_obj = {
-        "id": id,
+        "id": series_id,
         "type": "series" if media.get("media_type") == "tv" else "movie",
         "name": media.get("title", ""),
         "description": media.get("description", ""),
@@ -478,7 +583,24 @@ async def get_meta(token: str, media_type: str, id: str, token_data: dict = Depe
         for season in sorted(media.get("seasons", []), key=lambda s: s.get("season_number")):
             for episode in sorted(season.get("episodes", []), key=lambda e: e.get("episode_number")):
 
-                episode_id = f"{id}:{season['season_number']}:{episode['episode_number']}"
+                # Address episodes in the same ID namespace the request used,
+                # otherwise Stremio can't match the video back to this addon.
+                if is_kitsu:
+                    abs_ep = episode.get("absolute_episode")
+                    if abs_ep is None:
+                        # Legacy doc without absolute numbering: only safe to
+                        # assume absolute == episode_number on a single-season show.
+                        real_seasons = [
+                            sea for sea in media.get("seasons", [])
+                            if (sea.get("season_number") or 0) > 0
+                        ]
+                        if len(real_seasons) == 1:
+                            abs_ep = episode.get("episode_number")
+                    if abs_ep is None:
+                        continue
+                    episode_id = f"{series_id}:{abs_ep}"
+                else:
+                    episode_id = f"{series_id}:{season['season_number']}:{episode['episode_number']}"
 
                 videos.append({
                     "id": episode_id,
@@ -534,19 +656,11 @@ async def get_streams(
         }
 
 
-    try:
-        parts = id.split(":")
-        imdb_id = parts[0]
-        season_num = int(parts[1]) if len(parts) > 1 else None
-        episode_num = int(parts[2]) if len(parts) > 2 else None
-    except (ValueError, IndexError):
-        raise HTTPException(status_code=400, detail="Invalid Stremio ID format")
+    lookup = await resolve_media_request(id)
+    if not lookup:
+        return {"streams": []}
 
-    media_details = await db.get_media_details(
-        imdb_id=imdb_id,
-        season_number=season_num,
-        episode_number=episode_num
-    )
+    media_details = await db.get_media_details(**lookup)
 
     if not media_details or "telegram" not in media_details:
         return {"streams": []}
