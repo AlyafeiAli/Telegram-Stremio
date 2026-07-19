@@ -1,5 +1,6 @@
 import asyncio
 import traceback
+from difflib import SequenceMatcher
 import PTN
 import re
 from re import compile, IGNORECASE
@@ -64,12 +65,55 @@ ANIME_HINT_PATTERN = compile(
 # Checked against the ORIGINAL filename, before the tag is stripped.
 FANSUB_GROUP_PATTERN = compile(r'^\s*\[[^\]]{2,40}\]\s*\S')
 
+# Some groups tag at the END instead: "Detective Conan - 219 [MA-SHI].mp4".
+# We only count a trailing bracket as a group tag when its contents are NOT
+# purely technical metadata, so [1080p], [BD], [x265 FLAC] etc. don't qualify.
+TRAILING_BRACKET_PATTERN = compile(r'\[([^\]]{2,40})\]\s*(?:\.\w{2,4})?\s*$')
+
+TECHNICAL_BRACKET_TOKENS = compile(
+    r'^(?:'
+    r'\d{3,4}p|\d{3,4}x\d{3,4}|'
+    r'bd|bdrip|br|blu-?ray|web|webrip|web-?dl|hdtv|dvd|dvdrip|remux|'
+    r'x26[45]|h\.?26[45]|hevc|avc|xvid|divx|'
+    r'aac|ac3|flac|opus|dts|ddp?\d(?:\.\d)?|mp3|'
+    r'8bit|10bit|hi10p?|ma10p|yuv\d{3}p\d{1,2}|hdr|sdr|'
+    r'dual[\s._-]?audio|multi|sub(?:bed|s)?|dub(?:bed)?|raw|uncensored|'
+    r'eng|jap|jpn|esp|ita|ger|complete|batch|'
+    r'mkv|mp4|avi'
+    r')$',
+    IGNORECASE,
+)
+
+
+def _is_technical_bracket(content: str) -> bool:
+    """True if a bracket's contents are only technical/encoding metadata."""
+    c = content.strip()
+    if not c:
+        return True
+    # Whole-string match first, so hyphenated tokens like "WEB-DL" or
+    # "Blu-ray" aren't split apart and misread as a group name.
+    if TECHNICAL_BRACKET_TOKENS.match(c):
+        return True
+    parts = re.split(r'[\s,+._-]+', c)
+    parts = [p for p in parts if p]
+    if not parts:
+        return True
+    return all(TECHNICAL_BRACKET_TOKENS.match(p) for p in parts)
+
 
 def has_fansub_group_tag(filename: str) -> bool:
-    """True if the filename begins with a [Group] release tag."""
+    """True if the filename carries a [Group] release tag at either end."""
     if not filename:
         return False
-    return bool(FANSUB_GROUP_PATTERN.match(filename.rsplit("/", 1)[-1]))
+    name = filename.rsplit("/", 1)[-1]
+    if FANSUB_GROUP_PATTERN.match(name):
+        return True
+    # Trailing tag — check the CRC-stripped name so [DEADBEEF] doesn't count.
+    stripped = strip_crc32(name)
+    m = TRAILING_BRACKET_PATTERN.search(stripped)
+    if m and not _is_technical_bracket(m.group(1)):
+        return True
+    return False
 
 # ----------------- Helpers -----------------
 def strip_crc32(filename: str) -> str:
@@ -89,6 +133,30 @@ def pre_clean_anime_filename(filename: str) -> str:
     name = strip_crc32(name)                        # remove [DEADBEEF]
     name = BRACKET_GROUP_PATTERN.sub('', name)      # remove [GroupName] prefix
     return name
+
+
+def resolution_from_height(height) -> str | None:
+    """
+    Derive a quality label from the video track's pixel height, for releases
+    whose filename carries no resolution at all (common with older fansub
+    rips, e.g. "Detective Conan - 219 [MA-SHI].mp4").
+
+    Telegram supplies width/height on `message.video`; documents usually don't,
+    in which case this returns None and the caller decides what to do.
+    """
+    try:
+        h = int(height)
+    except (TypeError, ValueError):
+        return None
+    if h <= 0:
+        return None
+    # Snap to the nearest standard tier, rounding down.
+    for threshold, label in ((2160, "2160p"), (1440, "1440p"), (1080, "1080p"),
+                             (720, "720p"), (576, "576p"), (480, "480p"),
+                             (360, "360p"), (240, "240p")):
+        if h >= threshold:
+            return label
+    return f"{h}p"
 
 
 def extract_fallback_resolution(filename: str) -> str | None:
@@ -135,7 +203,14 @@ def extract_bare_anime_episode(title: str) -> tuple[str, int] | None:
     """
     if not title:
         return None
-    m = BARE_ANIME_EP_PATTERN.match(title.strip())
+    # PTN sometimes leaves a trailing extension or stray punctuation on the
+    # title when there's no resolution token to anchor on, e.g.
+    # "Naruto Shippuden - 245." — strip it so the trailing-digits anchor works.
+    cleaned = re.sub(
+        r'\.(mkv|mp4|avi|m4v|mov|ts|webm|flv|wmv)$', '', title.strip(), flags=IGNORECASE
+    )
+    cleaned = cleaned.strip(" ._-")
+    m = BARE_ANIME_EP_PATTERN.match(cleaned)
     if not m:
         return None
     base = m.group(1).strip(" -_.")
@@ -346,6 +421,57 @@ async def resolve_anime_absolute_episode(tmdb_id: int, absolute: int) -> tuple[i
 
 
 # ----------------- Kitsu -----------------
+def _normalise_for_match(s: str) -> str:
+    """Lowercase, drop punctuation/articles, collapse whitespace."""
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r'\(\d{4}\)', ' ', s)          # drop "(2009)" style years
+    s = re.sub(r'[^a-z0-9\s]', ' ', s)
+    s = re.sub(r'\s+', ' ', s)
+    return s.strip()
+
+
+def kitsu_match_score(parsed_title: str, anime: dict) -> float:
+    """
+    How well does a Kitsu search hit match the title we parsed from the file?
+
+    Kitsu's filter[text] is fuzzy and will happily return *something* for a
+    non-anime query, so we score the best of its known titles and let the
+    caller reject weak matches. Returns 0.0-1.0.
+    """
+    target = _normalise_for_match(parsed_title)
+    if not target:
+        return 0.0
+
+    candidates = [
+        anime.get("title"),
+        anime.get("canonical_title"),
+        anime.get("slug", "").replace("-", " ") if anime.get("slug") else None,
+    ]
+    candidates.extend((anime.get("titles") or {}).values())
+
+    best = 0.0
+    for cand in candidates:
+        c = _normalise_for_match(cand or "")
+        if not c:
+            continue
+        if c == target:
+            return 1.0
+        # A parsed title that is a clean prefix/subset of the official title
+        # is very common ("Hagane no Renkinjutsushi" vs
+        # "Hagane no Renkinjutsushi: Fullmetal Alchemist").
+        if target in c or c in target:
+            best = max(best, 0.9)
+        best = max(best, SequenceMatcher(None, target, c).ratio())
+    return best
+
+
+# Minimum similarity before we trust a Kitsu hit. Below this we fall through
+# to the TMDb/IMDb path rather than risk attaching wrong anime metadata.
+KITSU_MATCH_THRESHOLD = 0.72
+
+
 async def _kitsu_lookup(title: str) -> dict | None:
     """Search Kitsu and return the first hit (cached). None if no match."""
     key = f"kitsu_search::{title.lower().strip()}"
@@ -353,8 +479,31 @@ async def _kitsu_lookup(title: str) -> dict | None:
         return KITSU_CACHE[key]
     try:
         async with API_SEMAPHORE:
-            results = await kitsu_search_anime(title, limit=3)
-        result = results[0] if results else None
+            results = await kitsu_search_anime(title, limit=5)
+
+        # Pick the best-scoring hit rather than blindly taking the first, and
+        # reject the lot if nothing clears the similarity bar — Kitsu's fuzzy
+        # search returns results even for titles that aren't anime at all.
+        result = None
+        best_score = 0.0
+        for hit in (results or []):
+            score = kitsu_match_score(title, hit)
+            if score > best_score:
+                best_score, result = score, hit
+
+        if result and best_score < KITSU_MATCH_THRESHOLD:
+            LOGGER.info(
+                f"Rejecting weak Kitsu match for '{title}' -> "
+                f"'{result.get('title')}' (score={best_score:.2f} < "
+                f"{KITSU_MATCH_THRESHOLD}); falling back to TMDb/IMDb"
+            )
+            result = None
+        elif result:
+            LOGGER.info(
+                f"Kitsu match '{title}' -> '{result.get('title')}' "
+                f"(score={best_score:.2f})"
+            )
+
         KITSU_CACHE[key] = result
         return result
     except Exception as e:
@@ -581,7 +730,7 @@ async def fetch_anime_metadata_kitsu(
 
 
 # ----------------- Main Metadata -----------------
-async def metadata(filename: str, channel: int, msg_id, override_id: str = None) -> dict | None:
+async def metadata(filename: str, channel: int, msg_id, override_id: str = None, height=None) -> dict | None:
     clean_filename = pre_clean_anime_filename(filename)
 
     try:
@@ -604,7 +753,16 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
     season = parsed.get("season")
     episode = parsed.get("episode")
     year = parsed.get("year")
-    quality = parsed.get("resolution") or extract_fallback_resolution(filename)
+    # Resolution priority: parsed from name -> loose regex on name ->
+    # actual video track height reported by Telegram -> configured default.
+    # Documents (as opposed to videos) carry no height, so without the
+    # default they'd be skipped entirely.
+    quality = (
+        parsed.get("resolution")
+        or extract_fallback_resolution(filename)
+        or resolution_from_height(height)
+        or (Telegram.DEFAULT_QUALITY or None)
+    )
 
     # ----------------- Anime [NN] episode fallback -----------------
     # PTN doesn't recognize bare bracketed numbers like [03] as episodes
@@ -620,10 +778,17 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
             used_bracket_fallback = True
             title = clean_anime_title(title)
             LOGGER.info(f"Anime [NN] fallback: '{title}' episode #{episode}")
-        # 2) bare trailing episode number, e.g. "Slam Dunk 061", "Detective Conan 693"
-        #    Gated on anime hints OR a leading [Group] fansub tag, so we don't
-        #    mangle real movies like "Apollo 13" (which have neither).
-        elif ANIME_HINT_PATTERN.search(filename) or has_fansub_group_tag(filename):
+        # 2) bare trailing episode number, e.g. "Slam Dunk 061",
+        #    "Detective Conan 693". Fansub tags and encoder hints are only
+        #    *supporting* signals — plenty of releases have neither — so we
+        #    also fire when the filename carries no year at all. Movies nearly
+        #    always include a release year ("Apollo 13 1995 1080p"), which is
+        #    what keeps them out of this branch.
+        elif (
+            ANIME_HINT_PATTERN.search(filename)
+            or has_fansub_group_tag(filename)
+            or not year
+        ):
             bare = extract_bare_anime_episode(title)
             if bare:
                 title, episode = bare
@@ -637,7 +802,11 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
         LOGGER.warning(f"Missing episode in {filename}: {parsed}")
         return None
     if not quality:
-        LOGGER.warning(f"Skipping {filename}: No resolution (parsed={parsed})")
+        LOGGER.warning(
+            f"Skipping {filename}: No resolution in filename and Telegram "
+            f"reported no video height (parsed={parsed}). "
+            f"Re-upload as a video (not a document) or add e.g. '480p' to the caption."
+        )
         return None
     if not title:
         LOGGER.info(f"No title parsed from: {filename} (parsed={parsed})")
@@ -671,16 +840,17 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
     # Decide whether to try Kitsu first.
     # We only try Kitsu when there's no manual override and it really looks
     # like anime — i.e. bracket fallback fired, or no-season + anime hints.
-    # IMPORTANT: the Kitsu path interprets `episode` as an ABSOLUTE
-    # (series-wide) number. When the filename carries an explicit season
-    # marker (e.g. "Jujutsu Kaisen S2 - 17"), the number is season-relative,
-    # so sending it to Kitsu as an absolute would resolve the wrong episode.
-    # Those go down the normal TMDb/IMDb season path instead.
+    # Any file with an episode number but NO season marker is absolute-numbered,
+    # which in practice means anime — this is the same assumption the TMDb
+    # branch below already makes ("No season detected ... treating as anime
+    # absolute episode"). We therefore try Kitsu first for all of them, without
+    # requiring a [Group] tag or encoder hints, since plenty of releases carry
+    # neither. Safety comes from kitsu_match_score(): a weak title match is
+    # rejected and we fall through to TMDb/IMDb instead.
     is_anime = (
         not default_id
         and episode
         and not season
-        and looks_like_anime(filename, season, used_bracket_fallback)
     )
 
     try:
