@@ -472,40 +472,90 @@ def kitsu_match_score(parsed_title: str, anime: dict) -> float:
 KITSU_MATCH_THRESHOLD = 0.72
 
 
-async def _kitsu_lookup(title: str) -> dict | None:
-    """Search Kitsu and return the first hit (cached). None if no match."""
-    key = f"kitsu_search::{title.lower().strip()}"
+def _kitsu_start_year(anime: dict):
+    """Year an anime began airing, from Kitsu's ISO startDate. None if absent."""
+    sd = (anime or {}).get("start_date") or ""
+    try:
+        return int(str(sd).split("-")[0])
+    except (ValueError, IndexError):
+        return None
+
+
+async def _kitsu_lookup(title: str, year: int | None = None) -> dict | None:
+    """
+    Search Kitsu and return the best hit (cached). None if nothing is
+    convincing enough.
+
+    When the filename carries a year (e.g. "Hagane no Renkinjutsushi (2009)"),
+    it is used to disambiguate remakes and sequels that share a romaji title.
+    Without it, "Hagane no Renkinjutsushi" scores 1.00 against the 2003
+    Fullmetal Alchemist and only 0.90 against the 2009 Brotherhood entry
+    (whose official alternate title merely *contains* the query), so the wrong
+    series wins on title similarity alone.
+    """
+    key = f"kitsu_search::{title.lower().strip()}::{year or ''}"
     if key in KITSU_CACHE:
         return KITSU_CACHE[key]
     try:
         async with API_SEMAPHORE:
-            results = await kitsu_search_anime(title, limit=5)
+            results = await kitsu_search_anime(title, limit=8)
 
-        # Pick the best-scoring hit rather than blindly taking the first, and
-        # reject the lot if nothing clears the similarity bar — Kitsu's fuzzy
-        # search returns results even for titles that aren't anime at all.
-        result = None
-        best_score = 0.0
+        # Score every hit on title similarity and keep those that clear the
+        # bar — Kitsu's fuzzy search returns results even for non-anime.
+        viable = []
         for hit in (results or []):
-            score = kitsu_match_score(title, hit)
-            if score > best_score:
-                best_score, result = score, hit
+            sc = kitsu_match_score(title, hit)
+            if sc >= KITSU_MATCH_THRESHOLD:
+                viable.append((sc, hit))
 
-        if result and best_score < KITSU_MATCH_THRESHOLD:
-            LOGGER.info(
-                f"Rejecting weak Kitsu match for '{title}' -> "
-                f"'{result.get('title')}' (score={best_score:.2f} < "
-                f"{KITSU_MATCH_THRESHOLD}); falling back to TMDb/IMDb"
+        if not viable:
+            best = max(
+                ((kitsu_match_score(title, h), h) for h in (results or [])),
+                default=(0.0, None),
             )
-            result = None
-        elif result:
-            LOGGER.info(
-                f"Kitsu match '{title}' -> '{result.get('title')}' "
-                f"(score={best_score:.2f})"
-            )
+            if best[1] is not None:
+                LOGGER.info(
+                    f"Rejecting weak Kitsu match for '{title}' -> "
+                    f"'{best[1].get('title')}' (score={best[0]:.2f} < "
+                    f"{KITSU_MATCH_THRESHOLD}); falling back to TMDb/IMDb"
+                )
+            KITSU_CACHE[key] = None
+            return None
 
-        KITSU_CACHE[key] = result
-        return result
+        # Year is the decisive signal when we have it: an exact match wins
+        # outright, otherwise prefer the closest air year within a small
+        # window (anime seasons often straddle a new year).
+        chosen_score, chosen = max(viable, key=lambda t: t[0])
+        if year:
+            dated = [(sc, h, _kitsu_start_year(h)) for sc, h in viable]
+            dated = [(sc, h, y) for sc, h, y in dated if y is not None]
+
+            exact = [(sc, h) for sc, h, y in dated if y == year]
+            if exact:
+                chosen_score, chosen = max(exact, key=lambda t: t[0])
+            else:
+                near = [(abs(y - year), sc, h) for sc, h, y in dated
+                        if abs(y - year) <= 1]
+                if near:
+                    _, chosen_score, chosen = min(
+                        near, key=lambda t: (t[0], -t[1])
+                    )
+                elif dated:
+                    LOGGER.info(
+                        f"No Kitsu hit for '{title}' airs near {year}; "
+                        f"using best title match '{chosen.get('title')}'"
+                    )
+
+        LOGGER.info(
+            f"Kitsu match '{title}'"
+            f"{f' ({year})' if year else ''} -> '{chosen.get('title')}' "
+            f"(score={chosen_score:.2f}, "
+            f"start={chosen.get('start_date') or 'n/a'}, "
+            f"kitsu_id={chosen.get('kitsu_id')})"
+        )
+
+        KITSU_CACHE[key] = chosen
+        return chosen
     except Exception as e:
         LOGGER.warning(f"Kitsu search failed for '{title}': {e}")
         KITSU_CACHE[key] = None
@@ -581,6 +631,7 @@ async def fetch_anime_metadata_kitsu(
     absolute_episode: int,
     encoded_string,
     quality=None,
+    year: int | None = None,
 ) -> dict | None:
     """
     Build full metadata for an anime episode using Kitsu as the primary source.
@@ -591,7 +642,7 @@ async def fetch_anime_metadata_kitsu(
     any of (AnimeAPI, IMDb search, TMDb search) this function returns None
     and the caller falls back to the TMDb path.
     """
-    anime = await _kitsu_lookup(title)
+    anime = await _kitsu_lookup(title, year)
     if not anime:
         return None
 
@@ -862,6 +913,7 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None,
                 absolute_episode=absolute,
                 encoded_string=encoded_string,
                 quality=quality,
+                year=year,
             )
             if kitsu_meta:
                 return kitsu_meta
@@ -925,7 +977,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
         # so this entry is still reachable when Stremio requests it using a
         # kitsu:{id}:{absolute} identifier. Cached, so this is cheap.
         try:
-            kitsu_hit = await _kitsu_lookup(title)
+            kitsu_hit = await _kitsu_lookup(title, year)
             if kitsu_hit and kitsu_hit.get("kitsu_id"):
                 kitsu_id_out = str(kitsu_hit["kitsu_id"])
                 LOGGER.info(f"Attached kitsu_id={kitsu_id_out} to '{title}' (TMDb path)")
