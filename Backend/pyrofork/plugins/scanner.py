@@ -210,7 +210,7 @@ async def _scan_channel(client: Client, chat_id: int):
 
             # ── Metadata extraction (same pipeline as receiver) ──
             try:
-                metadata_info = await metadata(clean_filename(title), channel_int, msg_id)
+                metadata_info = await metadata(clean_filename(title), channel_int, msg_id, height=getattr(file, "height", None))
             except Exception as e:
                 LOGGER.warning(f"[Scanner] Metadata exception for msg {msg_id}: {e}")
                 metadata_info = None
