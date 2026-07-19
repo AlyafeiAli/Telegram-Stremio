@@ -393,6 +393,7 @@ class Database:
             media = MovieSchema(
                 tmdb_id=metadata_info['tmdb_id'],
                 imdb_id=metadata_info['imdb_id'],
+                kitsu_id=metadata_info.get('kitsu_id'),
                 db_index=self.current_db_index,
                 title=metadata_info['title'],
                 genres=metadata_info['genres'],
@@ -417,6 +418,7 @@ class Database:
             tv_show = TVShowSchema(
                 tmdb_id=metadata_info['tmdb_id'],
                 imdb_id=metadata_info['imdb_id'],
+                kitsu_id=metadata_info.get('kitsu_id'),
                 db_index=self.current_db_index,
                 title=metadata_info['title'],
                 genres=metadata_info['genres'],
@@ -433,6 +435,7 @@ class Database:
                     season_number=metadata_info['season_number'],
                     episodes=[Episode(
                         episode_number=metadata_info['episode_number'],
+                        absolute_episode=metadata_info.get('absolute_episode'),
                         title=metadata_info['episode_title'],
                         episode_backdrop=metadata_info['episode_backdrop'],
                         overview=metadata_info['episode_overview'],
@@ -457,6 +460,7 @@ class Database:
 
         imdb_id = movie_dict["imdb_id"]
         tmdb_id = movie_dict["tmdb_id"]
+        kitsu_id = movie_dict.get("kitsu_id")
         title = movie_dict["title"]
         release_year = movie_dict["release_year"]
 
@@ -478,6 +482,8 @@ class Database:
                 movie = await self.dbs[db_key]["movie"].find_one({"imdb_id": imdb_id})
             if not movie and tmdb_id:
                 movie = await self.dbs[db_key]["movie"].find_one({"tmdb_id": tmdb_id})
+            if not movie and kitsu_id:
+                movie = await self.dbs[db_key]["movie"].find_one({"kitsu_id": kitsu_id})
             if not movie and title and release_year:
                 movie = await self.dbs[db_key]["movie"].find_one({
                     "title": title,
@@ -504,6 +510,10 @@ class Database:
 
         # ---------------- UPDATE MOVIE ----------------
         movie_id = existing_movie["_id"]
+
+        if kitsu_id and not existing_movie.get("kitsu_id"):
+            existing_movie["kitsu_id"] = kitsu_id
+
         existing_qualities = existing_movie.get("telegram", [])
 
         if Telegram.REPLACE_MODE:
@@ -558,6 +568,7 @@ class Database:
 
         imdb_id = tv_show_dict.get("imdb_id")
         tmdb_id = tv_show_dict.get("tmdb_id")
+        kitsu_id = tv_show_dict.get("kitsu_id")
         title = tv_show_dict["title"]
         release_year = tv_show_dict["release_year"]
 
@@ -576,6 +587,8 @@ class Database:
                 tv = await self.dbs[db_key]["tv"].find_one({"imdb_id": imdb_id})
             if not tv and tmdb_id:
                 tv = await self.dbs[db_key]["tv"].find_one({"tmdb_id": tmdb_id})
+            if not tv and kitsu_id:
+                tv = await self.dbs[db_key]["tv"].find_one({"kitsu_id": kitsu_id})
             if not tv and title and release_year:
                 tv = await self.dbs[db_key]["tv"].find_one({
                     "title": title,
@@ -603,6 +616,12 @@ class Database:
         # ---------------- UPDATE TV ----------------
         tv_id = existing_tv["_id"]
 
+        # Backfill kitsu_id onto documents ingested before Kitsu support existed,
+        # so they become reachable via kitsu:{id} identifiers without a re-scan.
+        if kitsu_id and not existing_tv.get("kitsu_id"):
+            existing_tv["kitsu_id"] = kitsu_id
+            LOGGER.info(f"Backfilled kitsu_id={kitsu_id} onto existing TV doc {tv_id}")
+
         for season in tv_show_dict["seasons"]:
             existing_season = next(
                 (s for s in existing_tv["seasons"]
@@ -624,6 +643,10 @@ class Database:
                 if not existing_episode:
                     existing_season["episodes"].append(episode)
                     continue
+
+                # Backfill absolute numbering onto legacy episode docs.
+                if episode.get("absolute_episode") and not existing_episode.get("absolute_episode"):
+                    existing_episode["absolute_episode"] = episode["absolute_episode"]
 
                 existing_episode.setdefault("telegram", [])
 
@@ -797,17 +820,86 @@ class Database:
 
 
     async def get_media_details(
-        self, 
-        imdb_id: str,
-        season_number: Optional[int] = None, 
-        episode_number: Optional[int] = None
+        self,
+        imdb_id: Optional[str] = None,
+        season_number: Optional[int] = None,
+        episode_number: Optional[int] = None,
+        kitsu_id: Optional[str] = None,
+        absolute_episode: Optional[int] = None,
     ) -> Optional[dict]:
+        """
+        Look up a media document by IMDb ID or Kitsu ID.
+
+        Episode selection order:
+          1. absolute_episode (matches Episode.absolute_episode across all
+             seasons) — used for kitsu:{id}:{absolute} style requests.
+          2. season_number + episode_number — the classic tt-id path.
+          3. season_number alone, then whole-series / movie.
+        """
+        if not imdb_id and not kitsu_id:
+            return None
+
+        # Build the document filter once. imdb_id takes priority when both
+        # are supplied, since it's the more widely populated field.
+        if imdb_id:
+            doc_filter = {"imdb_id": imdb_id}
+        else:
+            doc_filter = {"kitsu_id": str(kitsu_id)}
+
+        def _identity(doc):
+            """Return the id fields to echo back on the response."""
+            return {
+                "imdb_id": doc.get("imdb_id") or imdb_id,
+                "kitsu_id": doc.get("kitsu_id") or kitsu_id,
+            }
 
         for db_idx in range(self.current_db_index, 0, -1):
             db_key = f"storage_{db_idx}"
-            
-            if episode_number is not None and season_number is not None:
-                tv_show = await self.dbs[db_key]["tv"].find_one({"imdb_id": imdb_id})
+
+            # ---------- absolute episode (Kitsu-style) ----------
+            if absolute_episode is not None:
+                tv_show = await self.dbs[db_key]["tv"].find_one(doc_filter)
+                if tv_show:
+                    for season in tv_show.get("seasons", []):
+                        for episode in season.get("episodes", []):
+                            if episode.get("absolute_episode") == absolute_episode:
+                                details = convert_objectid_to_str(episode)
+                                details.update({
+                                    **_identity(tv_show),
+                                    "type": "tv",
+                                    "season_number": season.get("season_number"),
+                                    "episode_number": episode.get("episode_number"),
+                                    "absolute_episode": absolute_episode,
+                                    "backdrop": episode.get("episode_backdrop"),
+                                    "db_index": db_idx,
+                                })
+                                return details
+
+                    # Fallback for legacy docs with no absolute_episode stored:
+                    # if the show is single-season, absolute == episode_number.
+                    seasons = tv_show.get("seasons", [])
+                    real_seasons = [
+                        sea for sea in seasons
+                        if (sea.get("season_number") or 0) > 0
+                    ]
+                    if len(real_seasons) == 1:
+                        for episode in real_seasons[0].get("episodes", []):
+                            if episode.get("episode_number") == absolute_episode:
+                                details = convert_objectid_to_str(episode)
+                                details.update({
+                                    **_identity(tv_show),
+                                    "type": "tv",
+                                    "season_number": real_seasons[0].get("season_number"),
+                                    "episode_number": episode.get("episode_number"),
+                                    "absolute_episode": absolute_episode,
+                                    "backdrop": episode.get("episode_backdrop"),
+                                    "db_index": db_idx,
+                                })
+                                return details
+
+            # ---------- season + episode ----------
+            elif episode_number is not None and season_number is not None:
+                tv_show = await self.dbs[db_key]["tv"].find_one(doc_filter)
                 if tv_show:
                     for season in tv_show.get("seasons", []):
                         if season.get("season_number") == season_number:
@@ -815,44 +907,46 @@ class Database:
                                 if episode.get("episode_number") == episode_number:
                                     details = convert_objectid_to_str(episode)
                                     details.update({
-                                        "imdb_id": imdb_id,
+                                        **_identity(tv_show),
                                         "type": "tv",
                                         "season_number": season_number,
                                         "episode_number": episode_number,
                                         "backdrop": episode.get("episode_backdrop"),
-                                        "db_index": db_idx
+                                        "db_index": db_idx,
                                     })
                                     return details
-            
+
+            # ---------- season only ----------
             elif season_number is not None:
-                tv_show = await self.dbs[db_key]["tv"].find_one({"imdb_id": imdb_id})
+                tv_show = await self.dbs[db_key]["tv"].find_one(doc_filter)
                 if tv_show:
                     for season in tv_show.get("seasons", []):
                         if season.get("season_number") == season_number:
                             details = convert_objectid_to_str(season)
                             details.update({
-                                "imdb_id": imdb_id,
+                                **_identity(tv_show),
                                 "type": "tv",
                                 "season_number": season_number,
-                                "db_index": db_idx
+                                "db_index": db_idx,
                             })
                             return details
-            
+
+            # ---------- whole series / movie ----------
             else:
-                tv_doc = await self.dbs[db_key]["tv"].find_one({"imdb_id": imdb_id})
+                tv_doc = await self.dbs[db_key]["tv"].find_one(doc_filter)
                 if tv_doc:
                     tv_doc = convert_objectid_to_str(tv_doc)
                     tv_doc["type"] = "tv"
                     tv_doc["db_index"] = db_idx
                     return tv_doc
-                
-                movie_doc = await self.dbs[db_key]["movie"].find_one({"imdb_id": imdb_id})
+
+                movie_doc = await self.dbs[db_key]["movie"].find_one(doc_filter)
                 if movie_doc:
                     movie_doc = convert_objectid_to_str(movie_doc)
                     movie_doc["type"] = "movie"
                     movie_doc["db_index"] = db_idx
                     return movie_doc
-        
+
         return None
 
     # -------------------------------
