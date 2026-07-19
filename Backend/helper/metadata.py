@@ -43,12 +43,33 @@ ANIME_EP_BRACKET_PATTERN = compile(
     IGNORECASE
 )
 
-# Common signals that a release is an anime fansub
+# Common signals that a release is an anime fansub.
+# Broadened: bare "BD"/"AVC"/"HEVC"/"YUV420P10" style tags are extremely common
+# in anime releases and were previously missed, which caused two files of the
+# SAME show to route through different metadata providers.
+# NOTE: deliberately does NOT include universal tokens like x264, AVC, BD or
+# BluRay. Those appear on ordinary movies too, and including them caused
+# "Apollo 13 1995 1080p BluRay x264" to be misparsed as "Apollo" episode 13.
+# Anime-specific encoder signatures only; the structural [Group] tag below
+# carries the rest of the load.
 ANIME_HINT_PATTERN = compile(
-    r'\b(?:hi10p?|ma10p|x265|hevc|10bit|dual[\s._-]?audio|sub(?:bed)?|dub(?:bed)?|'
+    r'\b(?:hi10p?|ma10p|yuv\d{3}p\d{1,2}|x265|hevc|10bit|'
+    r'dual[\s._-]?audio|sub(?:bed)?|dub(?:bed)?|'
     r'bdrip|webrip|web-dl|aac|flac|opus)\b',
     IGNORECASE,
 )
+
+# A leading [Group] tag (e.g. [Kaiyou], [DCAN], [ArabicAnimeTeam-Hagane]) is the
+# single strongest structural signal that a release is a fansub anime rip.
+# Checked against the ORIGINAL filename, before the tag is stripped.
+FANSUB_GROUP_PATTERN = compile(r'^\s*\[[^\]]{2,40}\]\s*\S')
+
+
+def has_fansub_group_tag(filename: str) -> bool:
+    """True if the filename begins with a [Group] release tag."""
+    if not filename:
+        return False
+    return bool(FANSUB_GROUP_PATTERN.match(filename.rsplit("/", 1)[-1]))
 
 # ----------------- Helpers -----------------
 def strip_crc32(filename: str) -> str:
@@ -142,11 +163,17 @@ def clean_anime_title(title: str) -> str:
 def looks_like_anime(filename: str, season, used_bracket_fallback: bool) -> bool:
     """
     Heuristic: is this release likely an anime?
-      - Anime [NN] bracket fallback fired (strongest signal)
-      - OR no season detected AND filename has anime-encoder hints
-        (Hi10p, Ma10p, x265, dual audio, sub/dub, fansub-style bracketing)
+      - Anime [NN]/bare-number fallback fired (strongest signal)
+      - OR a leading [Group] fansub tag is present
+      - OR filename has anime-encoder hints (Hi10p, Ma10p, x265, BD, FLAC...)
+
+    Note: a detected season no longer hard-vetoes anime classification. Anime
+    releases regularly carry an explicit season marker (e.g. "Jujutsu Kaisen
+    S2 - 17"); vetoing on season meant those never reached the Kitsu path.
     """
     if used_bracket_fallback:
+        return True
+    if has_fansub_group_tag(filename):
         return True
     if season:
         return False
@@ -521,6 +548,7 @@ async def fetch_anime_metadata_kitsu(
     return {
         "tmdb_id": tmdb_id_out,
         "imdb_id": imdb_id,
+        "kitsu_id": str(kitsu_id) if kitsu_id else None,
         "title": details.get("title") or clean_title,
         "year": year,
         "rate": rate,
@@ -592,9 +620,10 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
             used_bracket_fallback = True
             title = clean_anime_title(title)
             LOGGER.info(f"Anime [NN] fallback: '{title}' episode #{episode}")
-        # 2) bare trailing episode number, e.g. "Slam Dunk 061"
-        #    Gated on anime hints so we don't mangle real movies like "Apollo 13".
-        elif ANIME_HINT_PATTERN.search(filename):
+        # 2) bare trailing episode number, e.g. "Slam Dunk 061", "Detective Conan 693"
+        #    Gated on anime hints OR a leading [Group] fansub tag, so we don't
+        #    mangle real movies like "Apollo 13" (which have neither).
+        elif ANIME_HINT_PATTERN.search(filename) or has_fansub_group_tag(filename):
             bare = extract_bare_anime_episode(title)
             if bare:
                 title, episode = bare
@@ -642,9 +671,15 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
     # Decide whether to try Kitsu first.
     # We only try Kitsu when there's no manual override and it really looks
     # like anime — i.e. bracket fallback fired, or no-season + anime hints.
+    # IMPORTANT: the Kitsu path interprets `episode` as an ABSOLUTE
+    # (series-wide) number. When the filename carries an explicit season
+    # marker (e.g. "Jujutsu Kaisen S2 - 17"), the number is season-relative,
+    # so sending it to Kitsu as an absolute would resolve the wrong episode.
+    # Those go down the normal TMDb/IMDb season path instead.
     is_anime = (
         not default_id
         and episode
+        and not season
         and looks_like_anime(filename, season, used_bracket_fallback)
     )
 
@@ -711,9 +746,21 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
     #    Triggered when: no season, episode present
     # -------------------------------------------------------
     absolute_episode = None
+    kitsu_id_out = None
     if not season and episode:
         absolute_episode = int(episode)
         LOGGER.info(f"Detected anime absolute episode: {title} #{absolute_episode}")
+
+        # Attach a Kitsu ID even though we're resolving metadata via TMDb/IMDb,
+        # so this entry is still reachable when Stremio requests it using a
+        # kitsu:{id}:{absolute} identifier. Cached, so this is cheap.
+        try:
+            kitsu_hit = await _kitsu_lookup(title)
+            if kitsu_hit and kitsu_hit.get("kitsu_id"):
+                kitsu_id_out = str(kitsu_hit["kitsu_id"])
+                LOGGER.info(f"Attached kitsu_id={kitsu_id_out} to '{title}' (TMDb path)")
+        except Exception as e:
+            LOGGER.warning(f"Kitsu id attach failed for '{title}': {e}")
 
         if not tmdb_id:
             tmdb_search = await safe_tmdb_search(title, "tv", year)
@@ -806,6 +853,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
         return {
             "tmdb_id": tv.id,
             "imdb_id": getattr(getattr(tv, "external_ids", None), "imdb_id", None),
+            "kitsu_id": kitsu_id_out,
             "title": tv.name,
             "year": getattr(tv.first_air_date, "year", 0) if getattr(tv, "first_air_date", None) else 0,
             "rate": getattr(tv, "vote_average", 0) or 0,
@@ -844,6 +892,7 @@ async def fetch_tv_metadata(title, season, episode, encoded_string, year=None, q
     return {
         "tmdb_id": imdb.get("moviedb_id") or imdb_id.replace("tt", ""),
         "imdb_id": imdb_id,
+        "kitsu_id": kitsu_id_out,
         "title": imdb.get("title", title),
         "year": imdb.get("releaseDetailed", {}).get("year", 0),
         "rate": imdb.get("rating", {}).get("star", 0),
