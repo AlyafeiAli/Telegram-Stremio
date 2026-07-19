@@ -44,7 +44,7 @@ async def file_receive_handler(client: Client, message: Message):
                 size = get_readable_file_size(file.file_size)
                 channel = str(message.chat.id).replace("-100", "")
 
-                metadata_info = await metadata(clean_filename(title), int(channel), msg_id)
+                metadata_info = await metadata(clean_filename(title), int(channel), msg_id, height=getattr(file, "height", None))
                 if metadata_info is None:
                     LOGGER.warning(f"Metadata failed for file: {title} (ID: {msg_id})")
                     return
@@ -96,7 +96,7 @@ async def file_edited_handler(client: Client, message: Message):
                     
                     await db.delete_media_by_stream_id(stream_id_hash)
 
-                    metadata_info = await metadata(clean_filename(title), int(channel), msg_id, override_id=override_id)
+                    metadata_info = await metadata(clean_filename(title), int(channel), msg_id, override_id=override_id, height=getattr(file, "height", None))
                     if metadata_info is None:
                         LOGGER.warning(f"Metadata failed for edited file: {title} (ID: {msg_id})")
                         return
