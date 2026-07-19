@@ -21,6 +21,9 @@ class Episode(BaseModel):
     episode_backdrop: Optional[str] = None
     overview: Optional[str] = None
     released: Optional[str] = None
+    # Absolute (series-wide) episode number, used by Kitsu-style addons which
+    # address anime episodes as kitsu:{id}:{absolute}. None for non-anime.
+    absolute_episode: Optional[int] = None
     telegram: Optional[List[QualityDetail]]
 
 
@@ -38,6 +41,7 @@ class Season(BaseModel):
 class TVShowSchema(BaseModel):
     tmdb_id: Optional[int] = None
     imdb_id: Optional[str] = None
+    kitsu_id: Optional[str] = None
     db_index: int
     title: str
     genres: Optional[List[str]] = None
@@ -60,6 +64,7 @@ class TVShowSchema(BaseModel):
 class MovieSchema(BaseModel):
     tmdb_id: Optional[int] = None
     imdb_id: Optional[str] = None
+    kitsu_id: Optional[str] = None
     db_index: int
     title: str
     genres: Optional[List[str]] = None
